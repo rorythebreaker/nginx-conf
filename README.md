@@ -1,408 +1,437 @@
-# nginx-config-gen.sh
+# pngxconf — Nginx Management System
 
-Interactive TUI wizard for generating production-ready nginx reverse proxy configurations.
-Runs entirely in the terminal — no dependencies beyond bash and standard Linux utilities.
-
----
-
-## Requirements
-
-| Requirement | Details |
-|---|---|
-| Shell | bash 4.0 or newer |
-| OS | Linux (Debian/Ubuntu, RHEL/CentOS/Fedora/Rocky, Arch, openSUSE) |
-| Permissions | Regular user for generation and preview; **root required** for saving to `/etc/nginx/` and reloading nginx |
-| nginx | Optional — script works without nginx installed; Apply function requires it |
+Интерактивная TUI-система управления nginx: виртуальные хосты, SSL-сертификаты, редактирование `nginx.conf` с историей изменений. Вызывается командой `pngxconf`.
 
 ---
 
-## Installation
+## Требования
+
+| Компонент | Минимум | Примечание |
+|---|---|---|
+| bash | 4.0+ | `bash --version` |
+| nginx | любая актуальная | должен быть установлен в системе |
+| openssl | любая | нужен для работы с сертификатами |
+| root / sudo | обязательно | все операции требуют прав root |
+| ssl-wizard.sh | опционально | нужен только для создания сертификатов через мастер |
+
+---
+
+## Установка
 
 ```bash
-# Download and make executable
-chmod +x nginx-config-gen.sh
+# 1. Установить pngxconf
+cp pngxconf /usr/local/bin/pngxconf
+chmod +x /usr/local/bin/pngxconf
 
-# Run as root to save configs and reload nginx
-sudo ./nginx-config-gen.sh
+# 2. Установить ssl-wizard.sh (для создания сертификатов)
+mkdir -p /usr/local/lib/pngxconf
+cp ssl-wizard.sh /usr/local/lib/pngxconf/ssl-wizard.sh
+chmod +x /usr/local/lib/pngxconf/ssl-wizard.sh
+```
 
-# Run as regular user for preview and file generation to custom path
-./nginx-config-gen.sh
+После этого система доступна из любого места командой:
+
+```bash
+pngxconf
+pngxconf -h
 ```
 
 ---
 
-## Usage
+## Первый запуск
 
-The script has no command-line arguments. All interaction is through the TUI.
+При первом запуске система автоматически выполняет проверку окружения:
 
-**Navigation:**
-- `↑` / `↓` — move between items
-- `Enter` — select item / confirm input
-- `q` — go back / exit current menu
+- Наличие и версия бинарника nginx (ищет в `/usr/sbin/nginx`, `/usr/local/sbin/nginx`, `/usr/bin/nginx`)
+- Наличие файла `/etc/nginx/nginx.conf`
+- Наличие директории `/etc/nginx/conf.d/` — создаёт автоматически если отсутствует
+- Наличие директории `/etc/nginx/ssl/` — создаёт автоматически если отсутствует (права `700`)
+- Наличие `openssl`
+- Расположение `ssl-wizard.sh`
 
-On first launch, select the interface language (English or Russian). The choice applies to all menus and messages for the current session.
+Результат первой проверки сохраняется в базе состояния — повторно при следующих запусках не выполняется.
+
+**При последующих запусках** система молча проверяет:
+- Существование всех conf-файлов из базы сайтов
+- Существование всех файлов сертификатов и ключей из базы сертификатов
+- Несоответствия пишутся в лог `/var/lib/pngxconf/pngxconf.log`
 
 ---
 
-## Menu Structure
+## Расположение файлов
+
+Система строго следует стандартной структуре nginx:
 
 ```
-Language selection
-└── Main Menu
-    ├── Basic Parameters          ← required before saving
-    ├── SSL / TLS Settings
-    ├── Security Headers
-    ├── Advanced Proxy Settings
-    ├── Caching
-    ├── Limits and Timeouts
-    ├── Logging
-    ├── Compression (gzip)
-    ├── Advanced Options
-    ├── Preview Configuration
-    ├── Save Configuration        ← writes .conf file, optionally updates nginx.conf
-    └── Apply (reload nginx)      ← runs nginx -t then nginx -s reload
+/etc/nginx/
+├── nginx.conf                        главный конфиг nginx
+├── conf.d/
+│   ├── site1.conf                    конфиги виртуальных хостов
+│   └── site2.conf
+├── ssl/
+│   ├── example.com/
+│   │   ├── example.com.crt           сертификат
+│   │   ├── example.com.key           приватный ключ
+│   │   └── example.com.chain.pem    цепочка (если есть)
+│   └── api.example.com/
+│       ├── api.example.com.crt
+│       └── api.example.com.key
+└── pngxconf-backups/
+    ├── nginx.conf.20240115_143022.worker_processes
+    └── nginx.conf.20240115_150311.gzip_recommended
+
+/var/lib/pngxconf/
+├── state.conf      переменные состояния системы
+├── sites.db        база виртуальных хостов
+├── certs.db        база сертификатов
+└── pngxconf.log    лог всех операций
 ```
 
 ---
 
-## Configuration Parameters
+## Навигация в TUI
 
-### Basic Parameters (required)
-
-| Parameter | nginx directive | Default |
-|---|---|---|
-| Listen port | `listen` | `80` |
-| Domain or IP | `server_name` | — |
-| Internal IP | `proxy_pass` target | — |
-| Proxy port | `proxy_pass` target | `3000` |
-| Backend protocol | `proxy_pass` scheme | `http` |
-
-The internal IP and proxy port together form the upstream server address: `proxy_pass http://backend` where `backend` upstream resolves to `<ip>:<port>`.
+| Ввод | Действие |
+|---|---|
+| `1` – `9` | выбор пункта меню |
+| `0` | назад / выход из раздела |
+| `b` | назад (в полях ввода) |
+| `Enter` | подтвердить / значение по умолчанию |
+| `y` / `n` | подтверждение действий |
 
 ---
 
-### SSL / TLS Settings
+## Главное меню
 
-| Parameter | nginx directive | Default |
-|---|---|---|
-| Enable SSL | `listen 443 ssl` | off |
-| Certificate path | `ssl_certificate` | — |
-| Private key path | `ssl_certificate_key` | — |
-| Certificate chain | `ssl_trusted_certificate` | — |
-| TLS protocols | `ssl_protocols` | `TLSv1.2 TLSv1.3` |
-| Cipher suite | `ssl_ciphers` | ECDHE/CHACHA20 set |
-| HSTS | `Strict-Transport-Security` header | off |
-| HSTS max-age | `max-age=` value | `31536000` (1 year) |
-| OCSP Stapling | `ssl_stapling on` | off |
-| Session timeout | `ssl_session_timeout` | `1d` |
-| dhparam path | `ssl_dhparam` | — |
-| HTTP→HTTPS redirect | separate `server {}` block on port 80 | off |
-
-**SSL certificate picker:**
-When `/etc/nginx/ssl/` exists, the script lists all `.crt`, `.pem`, `.key`, `.cer` files found in that directory and lets you select one interactively. Selecting "Enter path manually" switches to a text input prompt.
-
-Enabling SSL automatically sets the listen port to `443`.
-
-Additional directives always written when SSL is enabled:
-```nginx
-ssl_prefer_server_ciphers on;
-ssl_session_cache         shared:SSL:10m;
-ssl_session_tickets       off;
 ```
-When OCSP Stapling is enabled, the resolver is set to `8.8.8.8 8.8.4.4`.
+pngxconf v1.0  │  Nginx Management System
 
----
+nginx 1.24.0  │  status: running  │  sites: 3  │  certs: 2
 
-### Security Headers
-
-| Parameter | nginx directive | Default |
-|---|---|---|
-| X-Frame-Options | `add_header X-Frame-Options` | `SAMEORIGIN` |
-| X-Content-Type-Options | `add_header X-Content-Type-Options "nosniff"` | on |
-| X-XSS-Protection | `add_header X-XSS-Protection "1; mode=block"` | on |
-| Referrer-Policy | `add_header Referrer-Policy` | `strict-origin-when-cross-origin` |
-| Content-Security-Policy | `add_header Content-Security-Policy` | off |
-| CSP value | value for the CSP header | `default-src 'self'` |
-| Permissions-Policy | `add_header Permissions-Policy` | off |
-| Hide nginx version | `server_tokens off` | on |
-
-All `add_header` directives are written with the `always` flag so they are included in error responses as well.
-
----
-
-### Advanced Proxy Settings
-
-| Parameter | nginx directive | Default |
-|---|---|---|
-| proxy_buffering | `proxy_buffering` | `on` |
-| proxy_buffer_size | `proxy_buffer_size` | `4k` |
-| proxy_buffers | `proxy_buffers` | `8 4k` |
-| proxy_read_timeout | `proxy_read_timeout` | `60s` |
-| proxy_connect_timeout | `proxy_connect_timeout` | `10s` |
-| proxy_send_timeout | `proxy_send_timeout` | `60s` |
-| Pass host headers | `proxy_set_header Host`, `X-Forwarded-Host`, `X-Forwarded-Port` | on |
-| Pass real client IP | `proxy_set_header X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto` | on |
-| WebSocket support | `Upgrade` / `Connection` headers + `proxy_http_version 1.1` | off |
-| proxy_intercept_errors | `proxy_intercept_errors on` | off |
-
-When WebSocket is disabled, the config still writes `proxy_http_version 1.1` and `proxy_set_header Connection ""` to enable HTTP/1.1 keepalive to the upstream.
-
----
-
-### Caching
-
-| Parameter | nginx directive | Default |
-|---|---|---|
-| Enable proxy cache | `proxy_cache` | off |
-| Cache zone name | `keys_zone=<name>` | `my_cache` |
-| Cache path | `proxy_cache_path` path | `/var/cache/nginx/my_cache` |
-| proxy_cache_valid | `proxy_cache_valid` | `200 1d` |
-| Cache bypass condition | `proxy_cache_bypass` | — |
-
-When caching is enabled, the following is always added to the location block:
-```nginx
-proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+  1)  nginx.conf Management      — workers, http, gzip, log formats
+  2)  Virtual Hosts              — create, enable, disable, delete
+  3)  SSL Certificates           — create, upload, inspect, expiry
+  4)  nginx Control              — test, reload, restart, stop, start
+  5)  System Status
+  0)  Exit
 ```
 
-> **nginx.conf modification:** Enabling cache and answering `y` to "update nginx.conf" injects the following line into the `http {}` block of `/etc/nginx/nginx.conf`:
-> ```nginx
-> proxy_cache_path /var/cache/nginx/my_cache levels=1:2 keys_zone=my_cache:10m max_size=1g inactive=60m use_temp_path=off;
-> ```
-> The injection is skipped if `keys_zone=<name>` is already present in nginx.conf.
-
 ---
 
-### Limits and Timeouts
+## Раздел 1 — nginx.conf Management
 
-| Parameter | nginx directive | Default |
+Редактирование `/etc/nginx/nginx.conf` через структурированные подменю. **Перед каждым изменением автоматически создаётся резервная копия** в `/etc/nginx/pngxconf-backups/` с именем вида `nginx.conf.YYYYMMDD_HHMMSS.<причина>`.
+
+### Подменю
+
+| Пункт | Что редактирует | Директивы |
 |---|---|---|
-| client_max_body_size | `client_max_body_size` | `10m` |
-| client_body_timeout | `client_body_timeout` | `60s` |
-| keepalive_timeout | `keepalive_timeout` | `75s` |
-| send_timeout | `send_timeout` | `60s` |
-| Enable rate limiting | `limit_req` | off |
-| Rate limit zone | `zone=<name>` | `one` |
-| Request rate | `rate=<n>r/s` | `10r/s` |
-| burst | `burst=<n>` | `20` |
+| View current nginx.conf | просмотр файла (первые 120 строк) | — |
+| Edit core worker settings | блок `main` | `worker_processes`, `worker_rlimit_nofile`, `user` |
+| Edit events block settings | блок `events {}` | `worker_connections`, `multi_accept`, `use` |
+| Edit http block global settings | блок `http {}` | `server_tokens`, `keepalive_timeout`, `client_max_body_size`, `sendfile`, `tcp_nopush`, `types_hash_max_size` |
+| Edit log formats | блок `http {}` | `log_format combined_plus`, `log_format json` |
+| Edit gzip settings | блок `http {}` | `gzip`, `gzip_comp_level`, `gzip_min_length`, `gzip_vary`, `gzip_proxied`, `gzip_types` |
+| Apply / reload nginx | — | `nginx -t` → `nginx -s reload` |
+| Test nginx configuration | — | `nginx -t` с выводом |
+| View change history | просмотр бэкапов | возможность восстановления |
 
-Rate limiting in the location block:
-```nginx
-limit_req zone=one burst=20 nodelay;
-```
+### Поведение при редактировании
 
-> **nginx.conf modification:** Enabling rate limiting and answering `y` to "update nginx.conf" injects the following into the `http {}` block of `/etc/nginx/nginx.conf`:
-> ```nginx
-> limit_req_zone $binary_remote_addr zone=one:10m rate=10r/s;
-> ```
-> The injection is skipped if `zone=<name>:` is already present in nginx.conf.
+Если директива уже существует в файле — значение заменяется через `sed -i`. Если директива отсутствует — вставляется после открывающей скобки нужного контекста. Каждое изменение фиксируется в `state.conf` и в `pngxconf.log`.
+
+### Восстановление из истории
+
+Пункт "View change history" показывает список бэкапов, отсортированных по дате. Выбор бэкапа заменяет текущий `nginx.conf` — при этом сначала создаётся бэкап текущей версии с меткой `pre_restore`.
 
 ---
 
-### Logging
+## Раздел 2 — Virtual Hosts
 
-| Parameter | nginx directive | Default |
+Управление файлами в `/etc/nginx/conf.d/`. Каждый виртуальный хост регистрируется в `/var/lib/pngxconf/sites.db`.
+
+### Создание виртуального хоста
+
+При выборе "Create new virtual host" система запрашивает:
+
+1. **Имя** — идентификатор (буквы, цифры, `-`, `_`). Создаёт файл `/etc/nginx/conf.d/<имя>.conf`
+2. **Тип сайта:**
+
+| Тип | Описание | Что генерируется |
 |---|---|---|
-| access_log path | `access_log` | `/var/log/nginx/access.log` |
-| error_log path | `error_log` | `/var/log/nginx/error.log` |
-| error_log level | second argument of `error_log` | `warn` |
-| Log format | format name for `access_log` | `combined` |
+| Reverse proxy | проксирование на внутренний IP:port | `upstream` блок + `proxy_pass` |
+| Static site | раздача статических файлов | `root` + `try_files` |
+| Reverse proxy + SSL | HTTPS прокси | всё выше + SSL-блок |
+| HTTP redirect to HTTPS | редирект 301 | `return 301 https://...` |
 
-Setting `access_log` to `off` disables access logging for this virtual host.
+3. **server_name** — домен или IP
+4. **Listen port** — порт (по умолчанию 80, для SSL — 443)
+5. Для прокси: **Upstream IP** и **Upstream port**
+6. Для SSL: выбор сертификата и ключа из `/etc/nginx/ssl/` или ввод пути вручную
 
-Available log levels: `debug`, `info`, `notice`, `warn`, `error`, `crit`, `alert`, `emerg`.
+После создания автоматически выполняется `nginx -t` с предложением сделать `reload`.
 
----
-
-### Compression (gzip)
-
-| Parameter | nginx directive | Default |
-|---|---|---|
-| Enable gzip | `gzip on` | on |
-| gzip_comp_level | `gzip_comp_level` | `6` |
-| gzip_min_length | `gzip_min_length` | `1024` |
-| gzip_vary | `gzip_vary on` | on |
-| gzip_proxied | `gzip_proxied` | `any` |
-| gzip_types | `gzip_types` | text, css, xml, js, json, svg |
-
----
-
-### Advanced Options
-
-| Parameter | nginx directive | Notes |
-|---|---|---|
-| root directory | `root` | For serving static files alongside proxy |
-| index files | `index` | Default: `index.html index.htm` |
-| try_files | `try_files` | e.g. `$uri $uri/ @backend` |
-| Upstream group name | `upstream <name>` | Default: `backend` |
-| upstream keepalive | `keepalive` | Connections kept open to upstream. Default: `32` |
-| Custom response headers | `add_header` | Semicolon-separated list, e.g. `X-App-Version 1.0; X-Env prod` |
-| Return 404 for unknown hosts | `location @fallback { return 404; }` | off |
-| Custom error pages | `error_page 404 500 502 503 504` | off |
-| Maintenance mode | `return 503` in location | Replaces proxy_pass with static 503 |
-| worker_processes | `worker_processes` in nginx.conf | Choices: auto, 1, 2, 4, 8 |
-| worker_connections | `worker_connections` in nginx.conf | Choices: 512, 1024, 2048, 4096 |
-
-> **nginx.conf modification:** Setting `worker_processes` or `worker_connections` and answering `y` to "update nginx.conf" uses `sed -i` to replace the existing values in-place in `/etc/nginx/nginx.conf`. A backup of the original file is created before any modification.
-
----
-
-## nginx.conf Modifications — Full Reference
-
-The script **only modifies `/etc/nginx/nginx.conf`** when:
-1. The user explicitly answers `y` (or `д` in Russian) to the "Also update nginx.conf?" prompt in the Save section.
-2. At least one of the following is configured: cache, rate limiting, worker_processes, or worker_connections.
-
-A timestamped backup is always created before any change:
-```
-/etc/nginx/nginx.conf.bak.1710000000
-```
-
-| Trigger | What changes in nginx.conf | Method |
-|---|---|---|
-| Cache enabled | `proxy_cache_path ...` injected into `http {}` | `sed` insert after `http {` |
-| Rate limiting enabled | `limit_req_zone ...` injected into `http {}` | `sed` insert after `http {` |
-| worker_processes set | Existing `worker_processes` line replaced | `sed -i` in-place replace |
-| worker_connections set | Existing `worker_connections` line replaced | `sed -i` in-place replace |
-
-Injections are idempotent — the script checks whether the directive already exists before inserting.
-
----
-
-## System Checks
-
-At startup, the script detects and displays in the status bar:
-
-| Check | Method | Result if missing |
-|---|---|---|
-| Linux distribution | `/etc/os-release` → `$ID` | Shows "unknown" |
-| nginx binary | `command -v` in common paths | Apply function disabled |
-| `/etc/nginx/conf.d/` | `test -d` | Warning shown |
-| `/etc/nginx/ssl/` | `test -d` | Warning shown; directory created when saving with SSL enabled |
-
-Detected distribution families: `debian`, `rhel`, `arch`, `suse`, `unknown`. The family is shown in brackets next to the distribution name.
-
----
-
-## Generated Config Structure
+### Генерируемая конфигурация (reverse proxy + SSL)
 
 ```nginx
-upstream backend {
-    server <ip>:<port>;
+upstream mysite_upstream {
+    server 10.0.0.5:3000;
     keepalive 32;
 }
 
-# HTTP → HTTPS redirect block (if SSL + redirect enabled)
 server {
-    listen      80;
-    server_name example.com;
-    return      301 https://$host$request_uri;
-}
-
-server {
-    listen      443 ssl;               # or configured port
+    listen      443 ssl;
+    listen      [::]:443 ssl;
     server_name example.com;
 
-    server_tokens off;                 # if enabled
+    server_tokens off;
 
-    # SSL block
-    ssl_certificate     ...;
-    ssl_certificate_key ...;
-    # ... other ssl_ directives
+    ssl_certificate         /etc/nginx/ssl/example.com/example.com.crt;
+    ssl_certificate_key     /etc/nginx/ssl/example.com/example.com.key;
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_ciphers             ECDHE-ECDSA-AES128-GCM-SHA256:...;
+    ssl_prefer_server_ciphers on;
+    ssl_session_cache       shared:SSL:10m;
+    ssl_session_timeout     1d;
+    ssl_session_tickets     off;
 
-    # HSTS (if enabled)
-    add_header Strict-Transport-Security "max-age=...";
+    add_header X-Frame-Options        "SAMEORIGIN"                      always;
+    add_header X-Content-Type-Options "nosniff"                         always;
+    add_header X-XSS-Protection       "1; mode=block"                   always;
+    add_header Referrer-Policy        "strict-origin-when-cross-origin" always;
 
-    # Security headers
-    add_header X-Frame-Options "SAMEORIGIN" always;
-    # ...
+    access_log  /var/log/nginx/example.com_access.log;
+    error_log   /var/log/nginx/example.com_error.log warn;
 
-    # Logging
-    access_log  /var/log/nginx/access.log;
-    error_log   /var/log/nginx/error.log warn;
-
-    # Client limits
-    client_max_body_size  10m;
-    # ...
-
-    # Gzip (if enabled)
-    gzip on;
-    # ...
-
-    # Rate limiting (if enabled)
-    limit_req zone=one burst=20 nodelay;
-
-    # Custom headers (if set)
-    # ...
-
-    # Custom error pages (if enabled)
-    # ...
-
-    # Static root (if set)
-    # ...
-
-    # Proxy location
     location / {
-        proxy_pass            http://backend;
-        proxy_buffering       on;
-        proxy_buffer_size     4k;
-        proxy_buffers         8 4k;
-        proxy_read_timeout    60s;
-        proxy_connect_timeout 10s;
-        proxy_send_timeout    60s;
-        proxy_set_header      Host             $host;
-        proxy_set_header      X-Real-IP        $remote_addr;
-        proxy_set_header      X-Forwarded-For  $proxy_add_x_forwarded_for;
-        # ... WebSocket headers if enabled
-        # ... proxy_cache if enabled
+        proxy_pass              http://mysite_upstream;
+        proxy_http_version      1.1;
+        proxy_set_header        Host              $host;
+        proxy_set_header        X-Real-IP         $remote_addr;
+        proxy_set_header        X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto $scheme;
+        proxy_set_header        Connection        "";
+        proxy_read_timeout      60s;
+        proxy_connect_timeout   10s;
+        proxy_send_timeout      60s;
+        proxy_buffering         on;
+        proxy_buffer_size       4k;
+        proxy_buffers           8 4k;
     }
 }
 ```
 
----
+### Enable / Disable
 
-## Save and Apply
+- **Disable** — переименовывает `site.conf` в `site.conf.disabled` (nginx перестаёт его читать)
+- **Enable** — переименовывает обратно в `site.conf`
+- После обоих действий предлагается `reload nginx`
 
-### Save
+### Удаление
 
-1. Prompts for output path (default: `/etc/nginx/conf.d/<server_name>.conf`)
-2. Creates the directory if it does not exist
-3. Writes the generated config
-4. If SSL is enabled and `/etc/nginx/ssl/` does not exist, creates it with `chmod 700`
-5. Asks whether to update `nginx.conf` (see nginx.conf Modifications above)
+Удаляет `.conf` и `.conf.disabled` файлы с диска, а также запись из `sites.db`. Файлы сертификатов **не удаляются**.
 
-### Apply
+### Check all site configs
 
-Requires root and a working nginx installation.
-
-1. Runs `nginx -t` — syntax test
-2. If test passes, asks for confirmation
-3. On confirmation, runs `nginx -s reload`
+Проверяет для каждого зарегистрированного сайта:
+- существование `.conf` файла
+- существование файлов сертификата и ключа (если назначены)
+- запускает `nginx -t`
 
 ---
 
-## Example: Minimal HTTPS Reverse Proxy
+## Раздел 3 — SSL Certificates
 
-Settings to configure for a typical HTTPS reverse proxy with an app running on port 8080:
+Управление сертификатами. База хранится в `/var/lib/pngxconf/certs.db`.
 
-| Menu | Parameter | Value |
-|---|---|---|
-| Basic | Listen port | `443` |
-| Basic | Domain | `app.example.com` |
-| Basic | Proxy IP | `127.0.0.1` |
-| Basic | Proxy port | `8080` |
-| SSL | Enable SSL | on |
-| SSL | Certificate | `/etc/nginx/ssl/app.crt` |
-| SSL | Key | `/etc/nginx/ssl/app.key` |
-| SSL | HTTP→HTTPS redirect | on |
-| Security | server_tokens off | on |
-| Save | Output path | `/etc/nginx/conf.d/app.conf` |
+### Create certificate — ssl-wizard.sh
+
+Запускает `ssl-wizard.sh` как вложенный процесс. После завершения мастера система сравнивает содержимое `/etc/nginx/ssl/` до и после — новые файлы предлагается зарегистрировать в базе.
+
+`ssl-wizard.sh` поддерживает:
+- Let's Encrypt (standalone, webroot, nginx mode, wildcard DNS, wildcard Cloudflare)
+- Self-signed: simple, RSA, ECDSA, Ed25519, Local CA
+- Генерация ключей и случайных байт
+
+Поиск `ssl-wizard.sh` выполняется в следующем порядке:
+1. `/usr/local/lib/pngxconf/ssl-wizard.sh` ← рекомендуемое расположение
+2. Директория рядом с бинарником `pngxconf`
+3. `/var/lib/pngxconf/ssl-wizard.sh`
+4. Ввод пути вручную (если не найден)
+
+### Upload / Register
+
+Загрузка уже имеющихся сертификатов:
+1. Вводятся имя записи и домен
+2. Создаётся директория `/etc/nginx/ssl/<domain>/`
+3. Исходный `.crt` файл копируется в `/etc/nginx/ssl/<domain>/<domain>.crt` (права `644`)
+4. Исходный `.key` файл копируется в `/etc/nginx/ssl/<domain>/<domain>.key` (права `600`)
+5. Цепочка (`.chain.pem`) — опционально
+6. Запись добавляется в `certs.db`
+
+Файлы всегда копируются — оригиналы не изменяются.
+
+### Inspect
+
+Показывает для выбранного сертификата:
+- Subject и Issuer
+- Период действия (notBefore / notAfter)
+- Subject Alternative Names
+- Серийный номер
+
+### Check expiry
+
+Показывает таблицу всех зарегистрированных сертификатов с подсветкой:
+
+| Цвет | Состояние |
+|---|---|
+| зелёный | действителен более 30 дней |
+| жёлтый | менее 30 дней до истечения |
+| красный | истёк |
+
+### Remove certificate record
+
+Удаляет только запись из `certs.db`. Файлы на диске **не удаляются**.
 
 ---
 
-## Notes
+## Раздел 4 — nginx Control
 
-- The script does not install nginx. Use your distribution's package manager.
-- The generated `.conf` file is self-contained and valid for inclusion in `conf.d/`.
-- All boolean settings in the TUI show `[ON]` / `[OFF]` (or `[ВКЛ]` / `[ВЫКЛ]` in Russian).
-- Settings persist within a session. Re-entering a section shows current values.
-- There is no import/export of settings between sessions.
+| Действие | Команда |
+|---|---|
+| Test | `nginx -t` |
+| Reload | `systemctl reload nginx` или `nginx -s reload` |
+| Restart | `systemctl restart nginx` |
+| Stop | `systemctl stop nginx` |
+| Start | `systemctl start nginx` |
+
+Перед Reload автоматически выполняется `nginx -t` — если тест провален, перезагрузка не производится.
+
+---
+
+## Раздел 5 — System Status
+
+Сводная информация: версия nginx, статус процесса, пути к ключевым директориям, количество сайтов и сертификатов в базе, дата последнего редактирования `nginx.conf`, дата первого запуска. Завершается выводом `nginx -t`.
+
+---
+
+## База состояния
+
+### `/var/lib/pngxconf/state.conf`
+
+Файл формата `KEY=VALUE`. Хранит:
+
+| Ключ | Содержимое |
+|---|---|
+| `FIRST_RUN_DONE` | `1` после завершения первой проверки |
+| `FIRST_RUN_DATE` | дата первого запуска |
+| `NGINX_BIN` | путь к бинарнику nginx |
+| `NGINX_VERSION` | версия nginx |
+| `NGINX_CONF_LAST_EDIT` | время последнего редактирования nginx.conf |
+| `NGINX_CONF_LAST_BAK` | путь к последнему бэкапу |
+| `SSL_WIZARD_PATH` | путь к ssl-wizard.sh |
+| `NGINX_WORKER_PROCESSES` | текущее значение worker_processes |
+| `NGINX_WORKER_CONNECTIONS` | текущее значение worker_connections |
+| `NGINX_GZIP` | текущее состояние gzip |
+| `NGINX_SERVER_TOKENS` | текущее состояние server_tokens |
+
+### `/var/lib/pngxconf/sites.db`
+
+Pipe-разделённый формат, одна строка на сайт:
+
+```
+name|conf_path|server_name|listen_port|ssl_cert|ssl_key|status|created
+```
+
+Пример:
+```
+myapp|/etc/nginx/conf.d/myapp.conf|app.example.com|443|/etc/nginx/ssl/app.example.com/app.example.com.crt|/etc/nginx/ssl/app.example.com/app.example.com.key|enabled|2024-01-15 14:30:22
+```
+
+### `/var/lib/pngxconf/certs.db`
+
+```
+name|domain|cert_path|key_path|chain_path|type|created
+```
+
+Пример:
+```
+myapp_cert|app.example.com|/etc/nginx/ssl/app.example.com/app.example.com.crt|/etc/nginx/ssl/app.example.com/app.example.com.key||manual|2024-01-15 14:28:10
+```
+
+Поле `type`: `manual` (загружен вручную) или `ssl-wizard` (создан через мастер).
+
+### `/var/lib/pngxconf/pngxconf.log`
+
+Текстовый лог всех операций с временными метками:
+
+```
+[2024-01-15 14:28:10] site_add name=myapp conf=/etc/nginx/conf.d/myapp.conf
+[2024-01-15 14:30:22] nginx.conf backup created: /etc/nginx/pngxconf-backups/nginx.conf.20240115_143022.worker_processes reason=worker_processes
+[2024-01-15 14:30:22] nginx.conf set worker_processes=4 in main
+[2024-01-15 14:31:05] nginx reloaded
+```
+
+---
+
+## Бэкапы nginx.conf
+
+Хранятся в `/etc/nginx/pngxconf-backups/`. Именование:
+
+```
+nginx.conf.YYYYMMDD_HHMMSS.<причина>
+```
+
+Примеры причин: `worker_processes`, `gzip_recommended`, `logformat_json`, `pre_restore`, `server_tokens`, `keepalive_timeout`.
+
+Бэкап создаётся **автоматически перед каждым изменением** — отдельный файл на каждое действие. Восстановление через пункт "View change history" в разделе nginx.conf Management.
+
+---
+
+## Безопасность файлов
+
+| Путь | Права |
+|---|---|
+| `/var/lib/pngxconf/` | `700` (только root) |
+| `/var/lib/pngxconf/state.conf` | `600` |
+| `/var/lib/pngxconf/sites.db` | `600` |
+| `/var/lib/pngxconf/certs.db` | `600` |
+| `/etc/nginx/ssl/` | `700` |
+| `/etc/nginx/ssl/<domain>/` | `700` |
+| `*.key` файлы | `600` |
+| `*.crt` / `*.pem` файлы | `644` |
+
+---
+
+## Типичный сценарий работы
+
+```bash
+# Первый запуск — проверит систему и создаст все нужные директории
+sudo pngxconf
+
+# Создать HTTPS reverse proxy для app.example.com → 127.0.0.1:8080
+# Главное меню → 3 (SSL Certificates) → 2 (Create) → запустит ssl-wizard
+# Главное меню → 2 (Virtual Hosts) → 2 (Create) → тип: Reverse proxy + SSL
+
+# Проверить статус всех сайтов
+# Главное меню → 2 → 6 (Check all site configs)
+
+# Включить gzip в nginx.conf
+# Главное меню → 1 (nginx.conf) → 6 (gzip) → 6 (Apply recommended)
+
+# Перезагрузить nginx
+# Главное меню → 4 (nginx Control) → 2 (Reload)
+
+# Проверить срок действия сертификатов
+# Главное меню → 3 (SSL Certificates) → 5 (Check expiry)
+```
+
+---
+
+## Справка
+
+```bash
+pngxconf -h
+```
+
+Выводит: описание, синтаксис вызова, расположение всех файлов, требования.
