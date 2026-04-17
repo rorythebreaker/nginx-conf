@@ -1,45 +1,45 @@
 # pngxconf — Nginx Management System
 
-Интерактивная TUI-система для управления nginx: виртуальные хосты, SSL-сертификаты, редактирование `nginx.conf` с историей изменений. Вызывается командой `pngxconf` из любой директории.
+Interactive TUI system for managing nginx: virtual hosts, SSL certificates, and `nginx.conf` editing with change history. Invoked by the `pngxconf` command from any directory.
 
-**Версия:** 1.1
-**Компоненты:** `install.sh` · `pngxconf` · `ssl-wizard.sh`
+**Version:** 1.1
+**Components:** `install.sh` · `pngxconf` · `ssl-wizard.sh`
 
 ---
 
-## Требования
+## Requirements
 
-| Компонент | Минимум | Примечание |
+| Component | Minimum | Notes |
 |---|---|---|
 | OS | Linux | Debian/Ubuntu, RHEL/Rocky/Fedora, Arch, openSUSE |
 | bash | 4.0+ | `bash --version` |
-| nginx | любая | автоустановщик проверит и предложит установить |
-| openssl | любая | нужен для сертификатов |
-| curl | любая | нужен `ssl-wizard.sh` для acme.sh |
-| socat | опционально | нужен только для acme.sh standalone |
-| root | обязательно | все операции требуют прав root |
+| nginx | any recent version | installer checks and offers to install |
+| openssl | any | required for certificates |
+| curl | any | required by `ssl-wizard.sh` for acme.sh |
+| socat | optional | only needed for acme.sh standalone mode |
+| root | required | all operations require root privileges |
 
 ---
 
-## Установка
+## Installation
 
-В директории с тремя файлами (`install.sh`, `pngxconf`, `ssl-wizard.sh`):
+In the directory containing all three files (`install.sh`, `pngxconf`, `ssl-wizard.sh`):
 
 ```bash
 sudo bash install.sh
 ```
 
-Установщик сам:
-1. Определит дистрибутив
-2. Проверит наличие bash 4+, nginx, openssl, curl, socat
-3. Предложит установить отсутствующие пакеты через `apt` / `dnf` / `pacman` / `zypper`
-4. Создаст все необходимые директории с правильными правами
-5. Скопирует `pngxconf` в `/usr/local/bin/pngxconf`
-6. Скопирует `ssl-wizard.sh` в `/usr/local/lib/pngxconf/ssl-wizard.sh`
-7. Проинициализирует state-файлы в `/var/lib/pngxconf/`
-8. Проверит, что `pngxconf` доступен в `PATH`
+The installer will:
+1. Detect the Linux distribution
+2. Check for bash 4+, nginx, openssl, curl, socat
+3. Offer to install missing packages via `apt` / `dnf` / `pacman` / `zypper`
+4. Create all required directories with correct permissions
+5. Copy `pngxconf` to `/usr/local/bin/pngxconf`
+6. Copy `ssl-wizard.sh` to `/usr/local/lib/pngxconf/ssl-wizard.sh`
+7. Initialise state files in `/var/lib/pngxconf/`
+8. Verify that `pngxconf` is available in `PATH`
 
-После установки — запуск из любой директории:
+After installation, the tool runs from any directory:
 
 ```bash
 sudo pngxconf
@@ -48,58 +48,58 @@ sudo pngxconf -h
 
 ---
 
-## Удаление
+## Uninstallation
 
 ```bash
 sudo bash install.sh --uninstall
 ```
 
-Удаляет бинарник и ssl-wizard. Затем отдельно спрашивает про `/var/lib/pngxconf/` (state-файлы).
-Конфиги nginx и сертификаты в `/etc/nginx/` **не удаляются**.
+Removes the binary and the SSL wizard. Separately asks whether to remove `/var/lib/pngxconf/` (state files).
+Nginx configs and certificates under `/etc/nginx/` are **not** removed.
 
 ---
 
-## Первый запуск
+## First Run
 
-При первом запуске `pngxconf` автоматически выполняет проверку окружения:
+On the first launch, `pngxconf` automatically performs an environment check:
 
-- Бинарник nginx (ищет в `/usr/sbin/`, `/usr/local/sbin/`, `/usr/bin/`)
+- nginx binary (searches `/usr/sbin/`, `/usr/local/sbin/`, `/usr/bin/`)
 - `/etc/nginx/nginx.conf`
-- `/etc/nginx/conf.d/` — создаёт если нет
-- `/etc/nginx/ssl/` — создаёт с правами `700` если нет
+- `/etc/nginx/conf.d/` — created if missing
+- `/etc/nginx/ssl/` — created with permissions `700` if missing
 - `openssl`
 - `ssl-wizard.sh`
 
-Флаг выполнения сохраняется в `/var/lib/pngxconf/state.conf`. Повторно не запускается.
+The completion flag is saved to `/var/lib/pngxconf/state.conf`. The check does not run again on subsequent launches.
 
-**На каждом следующем запуске** тихо проверяет (без визуального вывода):
-- Существование всех `conf`-файлов зарегистрированных сайтов
-- Существование файлов сертификатов и ключей из базы
-- Несоответствия пишутся в `/var/lib/pngxconf/pngxconf.log`
+**On every subsequent launch** the tool silently verifies:
+- Existence of all registered site `.conf` files
+- Existence of certificates and keys referenced in the database
+- Any discrepancies are written to `/var/lib/pngxconf/pngxconf.log`
 
 ---
 
-## Расположение файлов
+## File Layout
 
-Строго по стандарту nginx:
+Strictly follows the nginx standard:
 
 ```
 /usr/local/bin/
-└── pngxconf                           основной бинарник
+└── pngxconf                           main binary
 
 /usr/local/lib/pngxconf/
-└── ssl-wizard.sh                      SSL мастер
+└── ssl-wizard.sh                      SSL wizard
 
 /etc/nginx/
-├── nginx.conf                         главный конфиг nginx
+├── nginx.conf                         main nginx config
 ├── conf.d/
-│   ├── site1.conf                     виртуальные хосты
+│   ├── site1.conf                     virtual hosts
 │   └── site2.conf
 ├── ssl/
 │   ├── example.com/
-│   │   ├── example.com.crt            сертификат
-│   │   ├── example.com.key            приватный ключ
-│   │   └── example.com.chain.pem     цепочка (опц.)
+│   │   ├── example.com.crt            certificate
+│   │   ├── example.com.key            private key
+│   │   └── example.com.chain.pem     chain (optional)
 │   └── api.example.com/
 │       ├── api.example.com.crt
 │       └── api.example.com.key
@@ -108,29 +108,29 @@ sudo bash install.sh --uninstall
     └── nginx.conf.20240115_150311.gzip_recommended
 
 /var/lib/pngxconf/
-├── state.conf                          переменные состояния системы
-├── sites.db                            база виртуальных хостов
-├── certs.db                            база сертификатов
-└── pngxconf.log                        лог всех операций
+├── state.conf                          system state variables
+├── sites.db                            virtual hosts database
+├── certs.db                            certificates database
+└── pngxconf.log                        operation log
 ```
 
 ---
 
-## Навигация в TUI
+## TUI Navigation
 
-| Ввод | Действие |
+| Input | Action |
 |---|---|
-| `1`–`9` | выбор пункта меню |
-| `0` | назад (из любого подменю к родительскому) |
-| `b` | назад (в полях ввода и списках) |
-| `Enter` | подтвердить / значение по умолчанию |
-| `y` / `n` | подтверждение |
+| `1`–`9` | select menu item |
+| `0` | back (from any submenu to the parent) |
+| `b` | back (inside input prompts and lists) |
+| `Enter` | confirm / accept default |
+| `y` / `n` | confirmation |
 
-Навигация `b` работает **на всех уровнях** — от главного меню до вложенных форм ввода. В главном меню `0` означает выход из программы.
+The `b` key works on **every level** — from the main menu down to nested input forms. In the main menu, `0` exits the program.
 
 ---
 
-## Главное меню
+## Main Menu
 
 ```
 pngxconf v1.1  │  Nginx Management System
@@ -147,62 +147,62 @@ nginx 1.24.0  │  status: running  │  sites: 3  │  certs: 2
 
 ---
 
-## Раздел 1 — nginx.conf Management
+## Section 1 — nginx.conf Management
 
-Редактирование `/etc/nginx/nginx.conf` через структурированные подменю. **Перед каждым изменением автоматически создаётся timestamped-бэкап** в `/etc/nginx/pngxconf-backups/` с именем `nginx.conf.YYYYMMDD_HHMMSS.<причина>`.
+Structured editing of `/etc/nginx/nginx.conf` via submenus. **A timestamped backup is created automatically before every change** in `/etc/nginx/pngxconf-backups/` with the name `nginx.conf.YYYYMMDD_HHMMSS.<reason>`.
 
-### Подменю
+### Submenus
 
-| Пункт | Контекст | Директивы |
+| Item | Context | Directives |
 |---|---|---|
-| View current nginx.conf | — | просмотр первых 120 строк |
+| View current nginx.conf | — | view first 120 lines |
 | Edit core worker settings | `main` | `worker_processes`, `worker_rlimit_nofile`, `user` |
 | Edit events block settings | `events {}` | `worker_connections`, `multi_accept`, `use` |
 | Edit http block global | `http {}` | `server_tokens`, `keepalive_timeout`, `client_max_body_size`, `sendfile`, `tcp_nopush`, `types_hash_max_size` |
 | Edit log formats | `http {}` | `log_format combined_plus`, `log_format json` |
 | Edit gzip settings | `http {}` | `gzip`, `gzip_comp_level`, `gzip_min_length`, `gzip_vary`, `gzip_proxied`, `gzip_types` |
-| Apply / reload nginx | — | `nginx -t` затем `nginx -s reload` |
+| Apply / reload nginx | — | `nginx -t` then `nginx -s reload` |
 | Test nginx configuration | — | `nginx -t` |
-| View change history | — | список бэкапов, восстановление |
+| View change history | — | list of backups, restore |
 
-### Логика редактирования
+### Edit Logic
 
-Если директива уже существует в файле — значение заменяется через `sed`. Если отсутствует — вставляется после открывающей скобки нужного контекста. Каждое изменение:
-1. Создаёт бэкап
-2. Обновляет `state.conf` с временной меткой
-3. Пишет запись в `pngxconf.log`
+If a directive already exists in the file, its value is replaced via `sed`. If missing, it is inserted after the opening brace of the relevant context. Every change:
+1. Creates a backup
+2. Updates `state.conf` with a timestamp
+3. Writes an entry to `pngxconf.log`
 
-### Восстановление из истории
+### Restoring from History
 
-Подменю "View change history" показывает до 20 последних бэкапов, отсортированных по дате. При восстановлении сначала делается бэкап текущей версии с меткой `pre_restore`, затем выбранный бэкап копируется в `nginx.conf`.
+The "View change history" submenu lists up to 20 most recent backups sorted by date. When restoring, a backup of the current version is created first with the `pre_restore` tag, then the chosen backup is copied over `nginx.conf`.
 
 ---
 
-## Раздел 2 — Virtual Hosts
+## Section 2 — Virtual Hosts
 
-Управление файлами в `/etc/nginx/conf.d/`. Каждый виртуальный хост регистрируется в `sites.db`.
+Management of files in `/etc/nginx/conf.d/`. Each virtual host is registered in `sites.db`.
 
-### Создание виртуального хоста
+### Creating a Virtual Host
 
-Запрашивает:
-1. **Имя** (идентификатор, буквы/цифры/`-`/`_`) → файл `/etc/nginx/conf.d/<имя>.conf`
-2. **Тип сайта:**
+The tool prompts for:
+1. **Name** (identifier, letters/digits/`-`/`_`) → file `/etc/nginx/conf.d/<name>.conf`
+2. **Site type:**
 
-| Тип | Описание | Содержимое |
+| Type | Description | Content |
 |---|---|---|
-| Reverse proxy | HTTP-прокси на внутренний IP:port | `upstream` плюс `proxy_pass` |
-| Static site | раздача статических файлов | `root` плюс `try_files` |
-| Reverse proxy плюс SSL | HTTPS-прокси | всё выше плюс SSL-блок |
-| HTTP redirect | редирект 301 | `return 301 ...` |
+| Reverse proxy | HTTP proxy to an internal IP:port | `upstream` plus `proxy_pass` |
+| Static site | serves static files | `root` plus `try_files` |
+| Reverse proxy plus SSL | HTTPS proxy | above plus SSL block |
+| HTTP redirect | 301 redirect | `return 301 ...` |
 
-3. **server_name** — домен или IP
-4. **Listen port** — по умолчанию 80, для SSL — 443
-5. Для прокси: **Upstream IP** и **Upstream port**
-6. Для SSL: интерактивный выбор сертификата и ключа из `/etc/nginx/ssl/` (или ручной ввод пути)
+3. **server_name** — domain or IP
+4. **Listen port** — default 80, or 443 for SSL
+5. For proxy: **Upstream IP** and **Upstream port**
+6. For SSL: interactive picker for certificate and key from `/etc/nginx/ssl/` (or manual path entry)
 
-После создания выполняется `nginx -t` с предложением `reload`.
+After creation, `nginx -t` runs and a reload is offered.
 
-### Генерируемый конфиг (Reverse proxy плюс SSL)
+### Generated Config (Reverse proxy plus SSL)
 
 ```nginx
 upstream mysite_upstream {
@@ -254,138 +254,138 @@ server {
 
 ### Enable / Disable
 
-- **Disable** — `site.conf` переименовывается в `site.conf.disabled` (nginx перестаёт читать)
-- **Enable** — обратное переименование
-- В обоих случаях предлагается `reload nginx`
-- Статус синхронизируется в `sites.db`
+- **Disable** renames `site.conf` to `site.conf.disabled` (nginx stops reading it)
+- **Enable** renames it back
+- In both cases a reload is offered
+- Status is synced to `sites.db`
 
 ### Delete
 
-Удаляет `.conf` и `.conf.disabled` с диска плюс запись из `sites.db`. Сертификаты в `/etc/nginx/ssl/` **не удаляются**.
+Removes `.conf` and `.conf.disabled` from disk, plus the record from `sites.db`. Certificates in `/etc/nginx/ssl/` are **not** deleted.
 
 ### Check all site configs
 
-Для каждого сайта проверяет:
-- существование `.conf` или `.conf.disabled`
-- существование `cert` и `key` (если привязаны)
-- в конце запускает `nginx -t`
+For each site the tool verifies:
+- existence of `.conf` or `.conf.disabled`
+- existence of `cert` and `key` (if bound)
+- finally runs `nginx -t`
 
 ---
 
-## Раздел 3 — SSL Certificates
+## Section 3 — SSL Certificates
 
-Управление сертификатами. База в `/var/lib/pngxconf/certs.db`.
+Certificate management. Database at `/var/lib/pngxconf/certs.db`.
 
-### Create certificate — через ssl-wizard.sh
+### Create Certificate — via ssl-wizard.sh
 
-Запускает `ssl-wizard.sh` как вложенный процесс. После завершения мастера сравнивает содержимое `/etc/nginx/ssl/` до и после — новые файлы предлагает зарегистрировать в базе.
+Runs `ssl-wizard.sh` as a subprocess. After the wizard exits, `pngxconf` compares the contents of `/etc/nginx/ssl/` before and after — any new files are offered for registration in the database.
 
-`ssl-wizard.sh` поддерживает:
+`ssl-wizard.sh` supports:
 - **Let's Encrypt**: standalone, webroot, nginx mode, wildcard manual DNS, wildcard Cloudflare
-- **Self-signed**: simple (RSA без passphrase), RSA 2048/3072/4096, ECDSA P-256/P-384/P-521, Ed25519, Local CA плюс signed
-- **Утилиты**: генерация RSA/ECDSA/Ed25519 ключей, случайных байт (base64/hex)
+- **Self-signed**: simple (RSA no passphrase), RSA 2048/3072/4096, ECDSA P-256/P-384/P-521, Ed25519, Local CA plus signed cert
+- **Utilities**: RSA / ECDSA / Ed25519 key generation, random bytes (base64 / hex)
 
-Поиск `ssl-wizard.sh` в порядке:
-1. Путь из `state.conf` (`SSL_WIZARD_PATH`)
-2. `/usr/local/lib/pngxconf/ssl-wizard.sh` ← рекомендуемое расположение
-3. Директория рядом с бинарником `pngxconf`
+Search order for `ssl-wizard.sh`:
+1. Path from `state.conf` (`SSL_WIZARD_PATH`)
+2. `/usr/local/lib/pngxconf/ssl-wizard.sh` ← recommended location
+3. Directory next to the `pngxconf` binary
 4. `/var/lib/pngxconf/ssl-wizard.sh`
-5. Ручной ввод пути, если не найден
+5. Manual path entry if not found
 
 ### Upload / Register
 
-Загрузка имеющихся сертификатов:
-1. Вводятся имя записи и домен
-2. Создаётся `/etc/nginx/ssl/<domain>/` с правами `700`
-3. `.crt` копируется в `/etc/nginx/ssl/<domain>/<domain>.crt` (права `644`)
-4. `.key` копируется в `/etc/nginx/ssl/<domain>/<domain>.key` (права `600`)
-5. Цепочка — опционально в `<domain>.chain.pem`
-6. Запись добавляется в `certs.db`
+Loading existing certificates:
+1. Enter record name and domain
+2. `/etc/nginx/ssl/<domain>/` is created with permissions `700`
+3. `.crt` copied to `/etc/nginx/ssl/<domain>/<domain>.crt` (permissions `644`)
+4. `.key` copied to `/etc/nginx/ssl/<domain>/<domain>.key` (permissions `600`)
+5. Chain (optional) → `<domain>.chain.pem`
+6. Record added to `certs.db`
 
-Оригиналы **не изменяются** — всегда копирование.
+Source files are **not** modified — always copied.
 
 ### Inspect
 
-Для выбранного сертификата показывает:
+For the selected certificate shows:
 - Subject
 - Issuer
 - Validity (notBefore / notAfter)
 - Subject Alternative Names
 - Serial
 
-### Check expiry
+### Check Expiry
 
-Таблица всех зарегистрированных сертификатов с подсветкой:
+Table of all registered certificates with colour highlighting:
 
-| Цвет | Состояние |
+| Colour | State |
 |---|---|
-| зелёный | действителен более 30 дней |
-| жёлтый | менее 30 дней до истечения |
-| красный | истёк |
+| green | valid for more than 30 days |
+| yellow | fewer than 30 days to expiry |
+| red | expired |
 
-### Remove certificate record
+### Remove Certificate Record
 
-Удаляет только запись из `certs.db`. Файлы **не удаляются**.
+Removes the record from `certs.db` only. Files are **not** deleted.
 
 ---
 
-## Раздел 4 — nginx Control
+## Section 4 — nginx Control
 
-| Действие | Команда |
+| Action | Command |
 |---|---|
 | Test | `nginx -t` |
-| Reload | `systemctl reload nginx` или `nginx -s reload` |
+| Reload | `systemctl reload nginx` or `nginx -s reload` |
 | Restart | `systemctl restart nginx` |
 | Stop | `systemctl stop nginx` |
 | Start | `systemctl start nginx` |
 
-Перед Reload всегда выполняется `nginx -t` — при провале теста перезагрузка не производится.
+Before Reload, `nginx -t` is always executed — if the test fails, the reload is not performed.
 
 ---
 
-## Раздел 5 — System Status
+## Section 5 — System Status
 
-Сводная информация: версия nginx, статус процесса, пути к ключевым директориям, количество сайтов и сертификатов в БД, время последнего редактирования `nginx.conf`, дата первого запуска. В конце — вывод `nginx -t`.
+Summary information: nginx version, process status, paths to key directories, number of sites and certificates in the DB, time of last `nginx.conf` edit, first run date. Ends with `nginx -t` output.
 
 ---
 
-## База состояния
+## State Database
 
 ### `/var/lib/pngxconf/state.conf`
 
-Формат `KEY=VALUE`:
+Format `KEY=VALUE`:
 
-| Ключ | Содержимое |
+| Key | Content |
 |---|---|
-| `FIRST_RUN_DONE` | `1` после первой проверки |
-| `FIRST_RUN_DATE` | дата первого запуска |
-| `NGINX_BIN` | путь к бинарнику nginx |
-| `NGINX_VERSION` | версия nginx |
-| `NGINX_CONF_LAST_EDIT` | время последнего редактирования nginx.conf |
-| `NGINX_CONF_LAST_BAK` | путь к последнему бэкапу |
-| `SSL_WIZARD_PATH` | путь к ssl-wizard.sh |
-| `NGINX_WORKER_PROCESSES` | текущее значение |
-| `NGINX_WORKER_CONNECTIONS` | текущее значение |
+| `FIRST_RUN_DONE` | `1` after the first check |
+| `FIRST_RUN_DATE` | first run date |
+| `NGINX_BIN` | path to the nginx binary |
+| `NGINX_VERSION` | nginx version |
+| `NGINX_CONF_LAST_EDIT` | last nginx.conf edit time |
+| `NGINX_CONF_LAST_BAK` | path to the last backup |
+| `SSL_WIZARD_PATH` | path to ssl-wizard.sh |
+| `NGINX_WORKER_PROCESSES` | current value |
+| `NGINX_WORKER_CONNECTIONS` | current value |
 | `NGINX_GZIP` | `on` / `off` |
 | `NGINX_GZIP_LEVEL` | 1-9 |
 | `NGINX_SERVER_TOKENS` | `on` / `off` |
-| `NGINX_KEEPALIVE_TIMEOUT` | значение |
-| `NGINX_CLIENT_MAX_BODY` | значение |
+| `NGINX_KEEPALIVE_TIMEOUT` | value |
+| `NGINX_CLIENT_MAX_BODY` | value |
 
 ### `/var/lib/pngxconf/sites.db`
 
-Pipe-разделённый формат, строка на сайт:
+Pipe-separated format, one line per site:
 
 ```
 name|conf_path|server_name|listen_port|ssl_cert|ssl_key|status|created
 ```
 
-Пример:
+Example:
 ```
 myapp|/etc/nginx/conf.d/myapp.conf|app.example.com|443|/etc/nginx/ssl/app.example.com/app.example.com.crt|/etc/nginx/ssl/app.example.com/app.example.com.key|enabled|2024-01-15 14:30:22
 ```
 
-Поле `status`: `enabled` или `disabled`.
+Field `status`: `enabled` or `disabled`.
 
 ### `/var/lib/pngxconf/certs.db`
 
@@ -393,16 +393,16 @@ myapp|/etc/nginx/conf.d/myapp.conf|app.example.com|443|/etc/nginx/ssl/app.exampl
 name|domain|cert_path|key_path|chain_path|type|created
 ```
 
-Пример:
+Example:
 ```
 myapp_cert|app.example.com|/etc/nginx/ssl/app.example.com/app.example.com.crt|/etc/nginx/ssl/app.example.com/app.example.com.key||manual|2024-01-15 14:28:10
 ```
 
-Поле `type`: `manual` (загружен вручную) или `ssl-wizard` (создан через мастер).
+Field `type`: `manual` (uploaded by hand) or `ssl-wizard` (created via the wizard).
 
 ### `/var/lib/pngxconf/pngxconf.log`
 
-Текстовый лог всех операций:
+Plain-text log of all operations:
 
 ```
 [2024-01-15 14:28:10] first_run_check completed issues=0
@@ -414,23 +414,23 @@ myapp_cert|app.example.com|/etc/nginx/ssl/app.example.com/app.example.com.crt|/e
 
 ---
 
-## Бэкапы nginx.conf
+## nginx.conf Backups
 
-Хранятся в `/etc/nginx/pngxconf-backups/`. Именование:
+Stored in `/etc/nginx/pngxconf-backups/`. Naming:
 
 ```
-nginx.conf.YYYYMMDD_HHMMSS.<причина>
+nginx.conf.YYYYMMDD_HHMMSS.<reason>
 ```
 
-Примеры причин: `worker_processes`, `gzip_recommended`, `logformat_json`, `pre_restore`, `server_tokens`, `keepalive_timeout`, `multi_accept`, `io_method`, `client_max_body_size`.
+Example reasons: `worker_processes`, `gzip_recommended`, `logformat_json`, `pre_restore`, `server_tokens`, `keepalive_timeout`, `multi_accept`, `io_method`, `client_max_body_size`.
 
-Бэкап создаётся **автоматически перед каждым изменением**. Восстановление через пункт "View change history".
+A backup is created **automatically before every change**. Restoration happens through "View change history".
 
 ---
 
-## Безопасность файлов
+## File Permissions
 
-| Путь | Права |
+| Path | Permissions |
 |---|---|
 | `/var/lib/pngxconf/` | `700` (root) |
 | `/var/lib/pngxconf/state.conf` | `600` |
@@ -446,100 +446,100 @@ nginx.conf.YYYYMMDD_HHMMSS.<причина>
 
 ---
 
-## Типичные сценарии
+## Typical Workflows
 
-### Первая установка и создание HTTPS reverse proxy
+### First install and create HTTPS reverse proxy
 
 ```bash
-# 1. Установить
+# 1. Install
 sudo bash install.sh
 
-# 2. Запустить (первый раз — проверит окружение)
+# 2. Launch (first run — environment check)
 sudo pngxconf
 
-# 3. Создать сертификат:
+# 3. Create a certificate:
 #    Main menu → 3 (SSL Certificates) → 2 (Create certificate)
-#    Запустится ssl-wizard.sh — выбрать метод
-#    (Let's Encrypt / self-signed / и т.д.)
+#    ssl-wizard.sh launches — pick the method
+#    (Let's Encrypt / self-signed / etc.)
 
-# 4. Создать виртуальный хост:
+# 4. Create a virtual host:
 #    Main menu → 2 (Virtual Hosts) → 2 (Create)
-#    Тип: Reverse proxy плюс SSL
-#    Выбрать сертификат из списка
+#    Type: Reverse proxy plus SSL
+#    Pick the certificate from the list
 
-# 5. Проверить и применить:
-#    Автоматически после создания: nginx -t → reload
+# 5. Verify and apply:
+#    Automatic after creation: nginx -t → reload
 ```
 
-### Настройка gzip для всего сервера
+### Server-wide gzip setup
 
 ```
 Main menu → 1 (nginx.conf) → 6 (gzip) → 6 (Apply recommended)
 Main menu → 4 (nginx Control) → 2 (Reload)
 ```
 
-### Проверка срока действия всех сертификатов
+### Check expiry of all certificates
 
 ```
 Main menu → 3 (SSL Certificates) → 5 (Check expiry)
 ```
 
-### Временное отключение сайта
+### Temporarily disable a site
 
 ```
 Main menu → 2 (Virtual Hosts) → 4 (Enable/disable)
-→ выбрать сайт → автоматически переименуется в .conf.disabled
-→ подтвердить reload
+→ pick site → file renamed to .conf.disabled
+→ confirm reload
 ```
 
-### Загрузка существующего сертификата (ручная, без мастера)
+### Upload an existing certificate (manually, without the wizard)
 
 ```
 Main menu → 3 (SSL Certificates) → 3 (Upload / register existing)
-→ ввести имя записи, домен
-→ указать пути к .crt, .key (и опц. к chain)
-→ файлы копируются в /etc/nginx/ssl/<domain>/
-→ запись добавляется в certs.db
+→ enter record name, domain
+→ provide paths for .crt, .key (and optionally chain)
+→ files copied to /etc/nginx/ssl/<domain>/
+→ record added to certs.db
 ```
 
-### Откат изменения в nginx.conf
+### Roll back a change in nginx.conf
 
 ```
 Main menu → 1 (nginx.conf) → 9 (View change history)
-→ выбрать бэкап по дате → подтвердить восстановление
+→ pick backup by date → confirm restore
 Main menu → 4 (nginx Control) → 2 (Reload)
 ```
 
 ---
 
-## Справка
+## Help
 
 ```bash
-sudo pngxconf -h                   # справка по pngxconf
-sudo bash install.sh --help        # справка по установщику
-sudo bash install.sh --uninstall   # удаление
+sudo pngxconf -h                   # pngxconf help
+sudo bash install.sh --help        # installer help
+sudo bash install.sh --uninstall   # uninstall
 ```
 
 ---
 
-## Устранение неполадок
+## Troubleshooting
 
-| Проблема | Решение |
+| Problem | Solution |
 |---|---|
-| `pngxconf: command not found` | Перезапустите shell или добавьте `/usr/local/bin` в `PATH` |
-| `must be run as root` | Запускайте через `sudo pngxconf` |
-| `nginx not found` | Установите nginx через пакетный менеджер — `install.sh` предложит |
-| `ssl-wizard.sh not found` | Положите файл в `/usr/local/lib/pngxconf/` или укажите путь вручную |
-| Сайт создан, но nginx -t падает | Проверьте `nginx -t` в терминале, исправьте `/etc/nginx/conf.d/<имя>.conf` |
-| Сертификат истёк, нужно обновить | Main menu → 3 → 2 (создать новый через ssl-wizard) |
-| Хочу посмотреть лог | `cat /var/lib/pngxconf/pngxconf.log` |
+| `pngxconf: command not found` | Restart the shell or add `/usr/local/bin` to `PATH` |
+| `must be run as root` | Run via `sudo pngxconf` |
+| `nginx not found` | Install nginx via the package manager — `install.sh` will offer to |
+| `ssl-wizard.sh not found` | Place the file in `/usr/local/lib/pngxconf/` or specify the path manually |
+| Site created but nginx -t fails | Run `nginx -t` in the terminal, fix `/etc/nginx/conf.d/<name>.conf` |
+| Certificate expired, need to renew | Main menu → 3 → 2 (create a new one via ssl-wizard) |
+| View the log | `cat /var/lib/pngxconf/pngxconf.log` |
 
 ---
 
-## Архитектура
+## Architecture
 
-- **install.sh** (~370 строк) — автоустановщик с определением дистрибутива
-- **pngxconf** (~1850 строк) — основной бинарник с TUI, логикой БД, редактором nginx.conf
-- **ssl-wizard.sh** (~1025 строк) — мастер создания сертификатов
+- **install.sh** (~370 lines) — auto-installer with distro detection
+- **pngxconf** (~1850 lines) — main binary with TUI, DB logic, nginx.conf editor
+- **ssl-wizard.sh** (~1025 lines) — certificate creation wizard
 
-Все три компонента используют общий стандарт цветовой палитры ANSI 24-bit и единый стиль форматирования.
+All three components share a common ANSI 24-bit colour palette standard and a unified formatting style.
