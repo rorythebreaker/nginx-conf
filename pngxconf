@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  pngxconf — Nginx Management System
-#  Install: cp pngxconf /usr/local/bin/pngxconf && chmod +x /usr/local/bin/pngxconf
-#  Usage  : pngxconf  |  pngxconf -h
-#  Requires: bash 4+, nginx, openssl
+#  Install: sudo bash install.sh   (installs to /usr/local/bin/pngxconf)
+#  Usage  : pngxconf   |   pngxconf -h
+#  Requires: bash 4+, nginx, openssl, root
 # ==============================================================================
-set -euo pipefail
+set -uo pipefail
 
 # ==============================================================================
 #  Paths & constants
@@ -15,16 +15,14 @@ readonly PNGX_STATE_FILE="${PNGX_STATE_DIR}/state.conf"
 readonly PNGX_SITES_DB="${PNGX_STATE_DIR}/sites.db"
 readonly PNGX_CERTS_DB="${PNGX_STATE_DIR}/certs.db"
 readonly PNGX_LOG="${PNGX_STATE_DIR}/pngxconf.log"
-readonly PNGX_SSL_WIZARD="/usr/local/lib/pngxconf/ssl-wizard.sh"
+readonly PNGX_SSL_WIZARD_DEFAULT="/usr/local/lib/pngxconf/ssl-wizard.sh"
 
 readonly NGINX_CONF="/etc/nginx/nginx.conf"
 readonly NGINX_CONF_BAK_DIR="/etc/nginx/pngxconf-backups"
 readonly NGINX_CONFD="/etc/nginx/conf.d"
-readonly NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
-readonly NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 readonly NGINX_SSL_DIR="/etc/nginx/ssl"
 
-readonly PNGX_VERSION="1.0"
+readonly PNGX_VERSION="1.1"
 
 # ==============================================================================
 #  Colors — matches ssl-wizard.sh palette exactly
@@ -72,27 +70,34 @@ ${BOLD}Usage:${R}
   pngxconf          Launch interactive TUI
   pngxconf -h       Show this help
 
+${BOLD}Navigation inside TUI:${R}
+  1-9               select menu item
+  0                 back (from any submenu to the parent)
+  b                 back (inside input prompts and selection lists)
+  Enter             confirm / accept default value
+  y / n             yes / no for confirmations
+
 ${BOLD}What it does:${R}
   • Checks nginx installation on first run
   • Manages virtual host configurations in ${NGINX_CONFD}/
   • Manages SSL certificates in ${NGINX_SSL_DIR}/
-  • Edits and tracks changes to ${NGINX_CONF}
+  • Edits and tracks changes to ${NGINX_CONF} (with backups)
   • Integrates with ssl-wizard.sh for certificate creation
   • Persists all state in ${PNGX_STATE_DIR}/
 
 ${BOLD}File layout (nginx standard):${R}
-  ${NGINX_CONF}                  main nginx config
-  ${NGINX_CONFD}/*.conf            virtual host configs
-  ${NGINX_SSL_DIR}/<domain>/         certificates per domain
+  ${NGINX_CONF}               main nginx config
+  ${NGINX_CONFD}/*.conf         virtual host configs
+  ${NGINX_SSL_DIR}/<domain>/      certificates per domain
 
 ${BOLD}State files:${R}
-  ${PNGX_STATE_FILE}         runtime flags and nginx.conf cache
-  ${PNGX_SITES_DB}          known virtual host records
-  ${PNGX_CERTS_DB}          known certificate records
-  ${PNGX_LOG}        operation log
+  ${PNGX_STATE_FILE}        runtime flags / nginx.conf cache
+  ${PNGX_SITES_DB}         known virtual host records
+  ${PNGX_CERTS_DB}         known certificate records
+  ${PNGX_LOG}       operation log
 
 ${BOLD}Requirements:${R}
-  bash 4+, nginx, openssl, root
+  bash 4+, nginx, openssl, root privileges
 
 EOF
 }
@@ -101,54 +106,71 @@ EOF
 #  State helpers
 # ==============================================================================
 state_init() {
-    mkdir -p "${PNGX_STATE_DIR}" "${NGINX_CONF_BAK_DIR}" "${NGINX_SSL_DIR}" \
-             "${NGINX_CONFD}"
+    mkdir -p "${PNGX_STATE_DIR}" "${NGINX_CONF_BAK_DIR}"
     touch "${PNGX_STATE_FILE}" "${PNGX_SITES_DB}" "${PNGX_CERTS_DB}" "${PNGX_LOG}"
     chmod 700 "${PNGX_STATE_DIR}"
     chmod 600 "${PNGX_STATE_FILE}" "${PNGX_SITES_DB}" "${PNGX_CERTS_DB}"
-}
 
-state_get() { grep -m1 "^${1}=" "${PNGX_STATE_FILE}" 2>/dev/null | cut -d= -f2- || echo ""; }
-state_set() {
-    local key="$1" val="$2"
-    if grep -q "^${key}=" "${PNGX_STATE_FILE}" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "${PNGX_STATE_FILE}"
-    else
-        echo "${key}=${val}" >> "${PNGX_STATE_FILE}"
+    # nginx dirs created only if /etc/nginx exists (i.e. nginx is installed)
+    if [[ -d /etc/nginx ]]; then
+        mkdir -p "${NGINX_CONFD}"
+        [[ ! -d "${NGINX_SSL_DIR}" ]] && { mkdir -p "${NGINX_SSL_DIR}"; chmod 700 "${NGINX_SSL_DIR}"; }
     fi
 }
 
-# sites DB: one record per line — pipe-separated
-# FORMAT: name|conf_path|server_name|listen_port|ssl_cert|ssl_key|status|created
+state_get() {
+    grep -m1 "^${1}=" "${PNGX_STATE_FILE}" 2>/dev/null | cut -d= -f2-
+}
+state_set() {
+    local key="$1" val="$2"
+    local tmp; tmp=$(mktemp)
+    if grep -q "^${key}=" "${PNGX_STATE_FILE}" 2>/dev/null; then
+        grep -v "^${key}=" "${PNGX_STATE_FILE}" > "$tmp" 2>/dev/null || true
+        echo "${key}=${val}" >> "$tmp"
+        mv "$tmp" "${PNGX_STATE_FILE}"
+    else
+        echo "${key}=${val}" >> "${PNGX_STATE_FILE}"
+        rm -f "$tmp"
+    fi
+    chmod 600 "${PNGX_STATE_FILE}"
+}
+
+# sites DB: name|conf_path|server_name|listen_port|ssl_cert|ssl_key|status|created
 site_add() {
     local name="$1" conf="$2" sn="$3" port="$4" cert="${5:-}" key="${6:-}" status="${7:-enabled}"
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
-    # remove existing entry with same name
     site_remove "$name" 2>/dev/null || true
     echo "${name}|${conf}|${sn}|${port}|${cert}|${key}|${status}|${ts}" >> "${PNGX_SITES_DB}"
+    chmod 600 "${PNGX_SITES_DB}"
     _log "site_add name=${name} conf=${conf}"
 }
 site_remove() {
     local name="$1"
-    sed -i "/^${name}|/d" "${PNGX_SITES_DB}"
+    local tmp; tmp=$(mktemp)
+    grep -v "^${name}|" "${PNGX_SITES_DB}" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "${PNGX_SITES_DB}"
+    chmod 600 "${PNGX_SITES_DB}"
     _log "site_remove name=${name}"
 }
 site_set_status() {
-    local name="$1" status="$2"
-    sed -i "s|^${name}|\0|" "${PNGX_SITES_DB}" 2>/dev/null || true
-    # rebuild field 7
-    local line; line=$(grep "^${name}|" "${PNGX_SITES_DB}" 2>/dev/null | head -1) || true
-    [[ -z "$line" ]] && return 1
-    local f1 f2 f3 f4 f5 f6 _f7 f8
-    IFS='|' read -r f1 f2 f3 f4 f5 f6 _f7 f8 <<< "$line"
-    sed -i "s|^${name}|.*|${f1}|${f2}|${f3}|${f4}|${f5}|${f6}|${status}|${f8}|" "${PNGX_SITES_DB}" 2>/dev/null || true
+    local name="$1" new_status="$2"
+    local tmp; tmp=$(mktemp)
+    awk -F'|' -v n="$name" -v s="$new_status" 'BEGIN{OFS="|"} $1==n{$7=s} {print}' \
+        "${PNGX_SITES_DB}" > "$tmp"
+    mv "$tmp" "${PNGX_SITES_DB}"
+    chmod 600 "${PNGX_SITES_DB}"
+    _log "site_set_status name=${name} status=${new_status}"
 }
 site_get_field() {
-    # site_get_field <name> <field_number 1-8>
     local name="$1" field="$2"
-    grep "^${name}|" "${PNGX_SITES_DB}" 2>/dev/null | head -1 | cut -d'|' -f"${field}" || echo ""
+    grep "^${name}|" "${PNGX_SITES_DB}" 2>/dev/null | head -1 | cut -d'|' -f"${field}"
 }
-sites_list() { grep -v '^#' "${PNGX_SITES_DB}" 2>/dev/null | grep -v '^$' || true; }
+sites_list() {
+    grep -v '^#' "${PNGX_SITES_DB}" 2>/dev/null | grep -v '^$' || true
+}
+sites_count() {
+    sites_list | wc -l | tr -d ' '
+}
 
 # certs DB: name|domain|cert_path|key_path|chain_path|type|created
 cert_add() {
@@ -156,19 +178,34 @@ cert_add() {
     cert_remove "$name" 2>/dev/null || true
     local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
     echo "${name}|${domain}|${cert}|${key}|${chain}|${type}|${ts}" >> "${PNGX_CERTS_DB}"
+    chmod 600 "${PNGX_CERTS_DB}"
     _log "cert_add name=${name} domain=${domain}"
 }
-cert_remove() { sed -i "/^${1}|/d" "${PNGX_CERTS_DB}"; }
-cert_get_field() { grep "^${1}|" "${PNGX_CERTS_DB}" 2>/dev/null | head -1 | cut -d'|' -f"${2}" || echo ""; }
-certs_list() { grep -v '^#' "${PNGX_CERTS_DB}" 2>/dev/null | grep -v '^$' || true; }
+cert_remove() {
+    local name="$1"
+    local tmp; tmp=$(mktemp)
+    grep -v "^${name}|" "${PNGX_CERTS_DB}" > "$tmp" 2>/dev/null || true
+    mv "$tmp" "${PNGX_CERTS_DB}"
+    chmod 600 "${PNGX_CERTS_DB}"
+}
+cert_get_field() {
+    local name="$1" field="$2"
+    grep "^${name}|" "${PNGX_CERTS_DB}" 2>/dev/null | head -1 | cut -d'|' -f"${field}"
+}
+certs_list() {
+    grep -v '^#' "${PNGX_CERTS_DB}" 2>/dev/null | grep -v '^$' || true
+}
+certs_count() {
+    certs_list | wc -l | tr -d ' '
+}
 
 # ==============================================================================
-#  Input helpers
+#  Input helpers — global NAV signal: "back" means caller should return
 # ==============================================================================
 NAV=""
 
+# ask VARNAME "Prompt" ["default"]
 ask() {
-    # ask VARNAME "Prompt" ["default"]
     local -n _ref=$1
     local prompt="$2"
     local default="${3:-}"
@@ -185,7 +222,6 @@ ask() {
 }
 
 ask_optional() {
-    # ask_optional VARNAME "Prompt" — empty allowed
     local -n _oref=$1
     local prompt="$2"
     printf "  %s  ${DIM}(b = back, Enter = skip)${R}: " "$prompt"
@@ -194,6 +230,7 @@ ask_optional() {
     NAV=""; return 0
 }
 
+# menu_pick VARNAME label1 label2 ...
 menu_pick() {
     local -n _mp=$1; shift
     local max=$#
@@ -208,12 +245,31 @@ menu_pick() {
     done
 }
 
+# menu_choice VARNAME "prompt" min max
+# Accepts digits from min to max, 'b' for back (sets NAV=back), 'q' ignored.
+menu_choice() {
+    local -n _mc=$1
+    local prompt="$2"
+    local min="$3" max="$4"
+    while true; do
+        printf "  %s [${min}-${max}]  ${DIM}(b = back)${R}: " "$prompt"
+        IFS= read -r _mc
+        if [[ "${_mc,,}" == "b" ]]; then NAV="back"; return 1; fi
+        if [[ "$_mc" =~ ^[0-9]+$ ]] && (( _mc >= min && _mc <= max )); then
+            NAV=""; return 0
+        fi
+        warn "Invalid choice — enter a number between ${min} and ${max} (or 'b' to go back)."
+    done
+}
+
 confirm() {
     local ans
     printf "  %s [y/N]: " "$1"
     IFS= read -r ans
     [[ "${ans,,}" == "y" ]]
 }
+
+pause() { blank; read -rp "  Press Enter…" _; }
 
 clear_screen() { printf '\033[2J\033[H'; }
 
@@ -230,7 +286,6 @@ banner() {
 }
 
 section_banner() {
-    # section_banner "TITLE" "subtitle"
     banner
     echo -e "  ${BOLD}${CYAN}$1${R}"
     [[ -n "${2:-}" ]] && echo -e "  ${DIM}$2${R}"
@@ -243,15 +298,16 @@ section_banner() {
 nginx_bin() {
     local b
     for b in nginx /usr/sbin/nginx /usr/local/sbin/nginx /usr/bin/nginx; do
-        command -v "$b" &>/dev/null && { echo "$b"; return 0; }
+        if command -v "$b" &>/dev/null; then echo "$b"; return 0; fi
         [[ -x "$b" ]] && { echo "$b"; return 0; }
     done
     echo ""
+    return 1
 }
 
 nginx_version() {
-    local b; b=$(nginx_bin)
-    [[ -z "$b" ]] && echo "not found" && return
+    local b; b=$(nginx_bin) || { echo "not found"; return; }
+    [[ -z "$b" ]] && { echo "not found"; return; }
     "$b" -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1
 }
 
@@ -272,8 +328,9 @@ nginx_reload() {
 }
 
 nginx_is_running() {
-    systemctl is-active --quiet nginx 2>/dev/null || \
-    pgrep -x nginx &>/dev/null
+    systemctl is-active --quiet nginx 2>/dev/null && return 0
+    pgrep -x nginx &>/dev/null && return 0
+    return 1
 }
 
 # ==============================================================================
@@ -303,7 +360,7 @@ first_run_check() {
         echo -e "  ${DIM}Arch          :${R}  pacman -S nginx"
         echo -e "  ${DIM}openSUSE      :${R}  zypper install nginx"
         blank
-        (( issues++ ))
+        issues=$((issues+1))
     fi
 
     # nginx.conf
@@ -311,26 +368,33 @@ first_run_check() {
         ok "nginx.conf       : ${NGINX_CONF}"
     else
         warn "nginx.conf       : not found at ${NGINX_CONF}"
-        (( issues++ ))
+        issues=$((issues+1))
     fi
 
     # conf.d
     if [[ -d "$NGINX_CONFD" ]]; then
         ok "conf.d           : ${NGINX_CONFD}"
     else
-        warn "conf.d           : not found — creating"
-        mkdir -p "$NGINX_CONFD"
-        ok "conf.d           : created ${NGINX_CONFD}"
+        if [[ -d /etc/nginx ]]; then
+            warn "conf.d           : not found — creating"
+            mkdir -p "$NGINX_CONFD"
+            ok "conf.d           : created ${NGINX_CONFD}"
+        else
+            err "conf.d           : /etc/nginx missing"
+            issues=$((issues+1))
+        fi
     fi
 
     # ssl dir
     if [[ -d "$NGINX_SSL_DIR" ]]; then
         ok "ssl directory    : ${NGINX_SSL_DIR}"
     else
-        warn "ssl directory    : not found — creating"
-        mkdir -p "$NGINX_SSL_DIR"
-        chmod 700 "$NGINX_SSL_DIR"
-        ok "ssl directory    : created ${NGINX_SSL_DIR}"
+        if [[ -d /etc/nginx ]]; then
+            warn "ssl directory    : not found — creating"
+            mkdir -p "$NGINX_SSL_DIR"
+            chmod 700 "$NGINX_SSL_DIR"
+            ok "ssl directory    : created ${NGINX_SSL_DIR}"
+        fi
     fi
 
     # openssl
@@ -338,45 +402,36 @@ first_run_check() {
         ok "openssl          : $(openssl version | awk '{print $2}')"
     else
         warn "openssl          : not found (needed for certificates)"
-        (( issues++ ))
+        issues=$((issues+1))
     fi
 
     # ssl-wizard
-    if [[ -f "$PNGX_SSL_WIZARD" ]]; then
-        ok "ssl-wizard.sh    : ${PNGX_SSL_WIZARD}"
-        state_set "SSL_WIZARD_PATH" "$PNGX_SSL_WIZARD"
+    local wpath=""
+    for p in \
+        "$PNGX_SSL_WIZARD_DEFAULT" \
+        "$(dirname "$(readlink -f "$0")")/ssl-wizard.sh" \
+        "/opt/pngxconf/ssl-wizard.sh" \
+        "${PNGX_STATE_DIR}/ssl-wizard.sh"
+    do
+        if [[ -f "$p" ]]; then wpath="$p"; break; fi
+    done
+    if [[ -n "$wpath" ]]; then
+        ok "ssl-wizard.sh    : ${wpath}"
+        state_set "SSL_WIZARD_PATH" "$wpath"
     else
-        # search common locations
-        local wpath=""
-        for p in \
-            "$(dirname "$(readlink -f "$0")")/ssl-wizard.sh" \
-            "/usr/local/lib/pngxconf/ssl-wizard.sh" \
-            "/opt/pngxconf/ssl-wizard.sh" \
-            "${PNGX_STATE_DIR}/ssl-wizard.sh"
-        do
-            [[ -f "$p" ]] && { wpath="$p"; break; }
-        done
-        if [[ -n "$wpath" ]]; then
-            ok "ssl-wizard.sh    : ${wpath}"
-            state_set "SSL_WIZARD_PATH" "$wpath"
-        else
-            warn "ssl-wizard.sh    : not found — SSL wizard integration disabled"
-            warn "Place ssl-wizard.sh in ${PNGX_SSL_WIZARD} to enable"
-            state_set "SSL_WIZARD_PATH" ""
-        fi
+        warn "ssl-wizard.sh    : not found — cert creation wizard disabled"
+        warn "                   Place in ${PNGX_SSL_WIZARD_DEFAULT}"
+        state_set "SSL_WIZARD_PATH" ""
     fi
 
     blank; hr; blank
 
     if (( issues > 0 )); then
-        warn "${issues} issue(s) found. Fix them before continuing."
-        blank
-        read -rp "  Press Enter to continue anyway…" _
+        warn "${issues} issue(s) found. Fix them before using pngxconf fully."
     else
         ok "All checks passed."
-        blank
-        read -rp "  Press Enter to continue…" _
     fi
+    pause
 
     state_set "FIRST_RUN_DONE" "1"
     state_set "FIRST_RUN_DATE" "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -384,43 +439,32 @@ first_run_check() {
 }
 
 # ==============================================================================
-#  STARTUP CHECK (subsequent runs)
+#  STARTUP CHECK (silent background check on every subsequent run)
 # ==============================================================================
 startup_check() {
-    local warnings=0 errors=0
+    local warnings=0
 
-    # check all known site configs still exist
-    while IFS='|' read -r name conf sn port cert key status _ts; do
+    while IFS='|' read -r name conf _ _ cert key _ _; do
         [[ -z "$name" ]] && continue
-        if [[ ! -f "$conf" ]]; then
-            _log "WARN site '${name}' conf file missing: ${conf}"
-            (( warnings++ ))
-        fi
-        # check cert/key if assigned
-        if [[ -n "$cert" && ! -f "$cert" ]]; then
-            _log "WARN site '${name}' cert file missing: ${cert}"
-            (( warnings++ ))
-        fi
-        if [[ -n "$key" && ! -f "$key" ]]; then
-            _log "WARN site '${name}' key file missing: ${key}"
-            (( warnings++ ))
-        fi
+        [[ ! -f "$conf" ]] && { _log "WARN site '${name}' conf missing: ${conf}"; warnings=$((warnings+1)); }
+        [[ -n "$cert" && ! -f "$cert" ]] && { _log "WARN site '${name}' cert missing: ${cert}"; warnings=$((warnings+1)); }
+        [[ -n "$key"  && ! -f "$key"  ]] && { _log "WARN site '${name}' key missing:  ${key}";  warnings=$((warnings+1)); }
     done < <(sites_list)
 
-    # check all known certs still exist
-    while IFS='|' read -r name domain cert key chain _type _ts; do
+    while IFS='|' read -r name _ cert key _ _ _; do
         [[ -z "$name" ]] && continue
-        [[ -n "$cert" && ! -f "$cert" ]] && { _log "WARN cert '${name}' file missing: ${cert}"; (( warnings++ )); }
-        [[ -n "$key"  && ! -f "$key"  ]] && { _log "WARN cert '${name}' key missing: ${key}";  (( warnings++ )); }
+        [[ -n "$cert" && ! -f "$cert" ]] && { _log "WARN cert '${name}' file missing: ${cert}"; warnings=$((warnings+1)); }
+        [[ -n "$key"  && ! -f "$key"  ]] && { _log "WARN cert '${name}' key missing:  ${key}";  warnings=$((warnings+1)); }
     done < <(certs_list)
 
-    if (( warnings > 0 || errors > 0 )); then
-        warn "${warnings} warning(s) detected on startup — check log: ${PNGX_LOG}"
+    if (( warnings > 0 )); then
+        warn "${warnings} file(s) referenced in DB are missing — see ${PNGX_LOG}"
+        sleep 1
     fi
 }
 
 # ==============================================================================
-#  SECTION: nginx.conf editor
+#  nginx.conf section
 # ==============================================================================
 section_nginx_conf() {
     while true; do
@@ -441,12 +485,11 @@ section_nginx_conf() {
         echo -e "  ${BLUE}  7)${R}  Apply / reload nginx"
         echo -e "  ${BLUE}  8)${R}  Test nginx configuration"
         echo -e "  ${BLUE}  9)${R}  View change history"
-        echo -e "  ${RED}  0)${R}  Back to main menu"
+        echo -e "  ${RED}  0)${R}  Back to main menu  ${DIM}(or 'b')${R}"
         blank; hr; blank
 
         local c
-        printf "  Select [0-9]: "
-        IFS= read -r c
+        menu_choice c "Select" 0 9 || return  # 'b' triggers return
         case "$c" in
             1) _nginx_conf_view ;;
             2) _nginx_conf_workers ;;
@@ -458,7 +501,6 @@ section_nginx_conf() {
             8) _nginx_test_show ;;
             9) _nginx_conf_history ;;
             0) return ;;
-            *) warn "Invalid choice." ;;
         esac
     done
 }
@@ -473,34 +515,27 @@ _nginx_conf_view() {
         local lines; lines=$(wc -l < "$NGINX_CONF")
         (( lines > 120 )) && info "(${lines} total lines — showing first 120)"
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _nginx_conf_backup() {
     local reason="${1:-manual}"
+    [[ ! -f "$NGINX_CONF" ]] && return 1
     local bak="${NGINX_CONF_BAK_DIR}/nginx.conf.$(date +%Y%m%d_%H%M%S).${reason}"
     cp "$NGINX_CONF" "$bak"
     state_set "NGINX_CONF_LAST_BAK" "$bak"
-    _log "nginx.conf backup created: ${bak} reason=${reason}"
+    _log "nginx.conf backup: ${bak} reason=${reason}"
     echo "$bak"
 }
 
-_nginx_conf_sed() {
-    # _nginx_conf_sed <pattern> <replacement> <reason>
-    local pat="$1" rep="$2" reason="${3:-edit}"
-    _nginx_conf_backup "$reason" >/dev/null
-    sed -i "$pat" "$NGINX_CONF"
-    _log "nginx.conf sed reason=${reason} pat=${pat}"
-}
-
 _nginx_conf_set_param() {
-    # _nginx_conf_set_param <key> <value> <context: main|events|http> <reason>
+    # key value context=main|events|http reason
     local key="$1" val="$2" ctx="${3:-main}" reason="${4:-set_${1}}"
+    [[ ! -f "$NGINX_CONF" ]] && { err "nginx.conf not found"; return 1; }
     _nginx_conf_backup "$reason" >/dev/null
-    if grep -q "^\s*${key}\s" "$NGINX_CONF"; then
-        sed -i "s|^\(\s*\)${key}\s.*;|\1${key} ${val};|" "$NGINX_CONF"
+    if grep -qE "^\s*${key}(\s|;)" "$NGINX_CONF"; then
+        sed -i "s|^\(\s*\)${key}\s[^;]*;|\1${key} ${val};|" "$NGINX_CONF"
     else
-        # insert after context opening brace
         sed -i "/^\s*${ctx}\s*{/a\\    ${key} ${val};" "$NGINX_CONF"
     fi
     state_set "NGINX_CONF_LAST_EDIT" "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -508,289 +543,321 @@ _nginx_conf_set_param() {
 }
 
 _nginx_conf_workers() {
-    section_banner "nginx.conf — Worker Settings" "Applies to: main context"
+    while true; do
+        section_banner "nginx.conf — Worker Settings" "Applies to: main context"
 
-    local cur_proc; cur_proc=$(grep -m1 '^\s*worker_processes' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "auto")
-    local cur_rlimit; cur_rlimit=$(grep -m1 '^\s*worker_rlimit_nofile' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "")
-    local cur_user; cur_user=$(grep -m1 '^\s*user\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "nginx")
+        local cur_proc cur_rlimit cur_user
+        cur_proc=$(grep -m1 '^\s*worker_processes' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_rlimit=$(grep -m1 '^\s*worker_rlimit_nofile' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_user=$(grep -m1 '^\s*user\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
 
-    echo -e "  ${DIM}Current worker_processes  :${R} ${WHITE}${cur_proc}${R}"
-    echo -e "  ${DIM}Current worker_rlimit     :${R} ${WHITE}${cur_rlimit:-not set}${R}"
-    echo -e "  ${DIM}Current user              :${R} ${WHITE}${cur_user}${R}"
-    blank
-    echo -e "  ${BLUE}  1)${R}  Set worker_processes   ${DIM}(auto / 1 / 2 / 4 / 8)${R}"
-    echo -e "  ${BLUE}  2)${R}  Set worker_rlimit_nofile"
-    echo -e "  ${BLUE}  3)${R}  Set user"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+        echo -e "  ${DIM}Current worker_processes   :${R} ${WHITE}${cur_proc:-auto}${R}"
+        echo -e "  ${DIM}Current worker_rlimit      :${R} ${WHITE}${cur_rlimit:-not set}${R}"
+        echo -e "  ${DIM}Current user               :${R} ${WHITE}${cur_user:-nginx}${R}"
+        blank
+        echo -e "  ${BLUE}  1)${R}  Set worker_processes   ${DIM}(auto / 1 / 2 / 4 / 8)${R}"
+        echo -e "  ${BLUE}  2)${R}  Set worker_rlimit_nofile"
+        echo -e "  ${BLUE}  3)${R}  Set user"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-3]: "; IFS= read -r c
-    case "$c" in
-        1)
-            blank
-            echo -e "  ${BLUE}  1)${R}  auto"
-            echo -e "  ${BLUE}  2)${R}  1"
-            echo -e "  ${BLUE}  3)${R}  2"
-            echo -e "  ${BLUE}  4)${R}  4"
-            echo -e "  ${BLUE}  5)${R}  8"
-            blank; hr; blank
-            local wc; menu_pick wc "auto" "1" "2" "4" "8" || return
-            local vals=("auto" "1" "2" "4" "8")
-            local wval="${vals[$((wc-1))]}"
-            _nginx_conf_set_param "worker_processes" "$wval" "main" "worker_processes"
-            ok "worker_processes set to ${wval}"
-            state_set "NGINX_WORKER_PROCESSES" "$wval"
-            ;;
-        2)
-            local wrl; ask wrl "worker_rlimit_nofile value" "65535" || return
-            _nginx_conf_set_param "worker_rlimit_nofile" "$wrl" "main" "worker_rlimit_nofile"
-            ok "worker_rlimit_nofile set to ${wrl}"
-            state_set "NGINX_WORKER_RLIMIT" "$wrl"
-            ;;
-        3)
-            local wu; ask wu "nginx user" "$cur_user" || return
-            _nginx_conf_set_param "user" "$wu" "main" "user"
-            ok "user set to ${wu}"
-            ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    sleep 0.6; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 3 || return
+        case "$c" in
+            1)
+                blank
+                echo -e "  ${BLUE}  1)${R}  auto"
+                echo -e "  ${BLUE}  2)${R}  1"
+                echo -e "  ${BLUE}  3)${R}  2"
+                echo -e "  ${BLUE}  4)${R}  4"
+                echo -e "  ${BLUE}  5)${R}  8"
+                blank; hr; blank
+                local wc; menu_pick wc "auto" "1" "2" "4" "8" || continue
+                local vals=("auto" "1" "2" "4" "8")
+                local wval="${vals[$((wc-1))]}"
+                _nginx_conf_set_param "worker_processes" "$wval" "main" "worker_processes"
+                ok "worker_processes set to ${wval}"
+                state_set "NGINX_WORKER_PROCESSES" "$wval"
+                pause
+                ;;
+            2)
+                local wrl
+                if ask wrl "worker_rlimit_nofile value" "65535"; then
+                    _nginx_conf_set_param "worker_rlimit_nofile" "$wrl" "main" "worker_rlimit_nofile"
+                    ok "worker_rlimit_nofile set to ${wrl}"
+                    state_set "NGINX_WORKER_RLIMIT" "$wrl"
+                    pause
+                fi
+                ;;
+            3)
+                local wu
+                if ask wu "nginx user" "${cur_user:-nginx}"; then
+                    _nginx_conf_set_param "user" "$wu" "main" "user"
+                    ok "user set to ${wu}"
+                    pause
+                fi
+                ;;
+            0) return ;;
+        esac
+    done
 }
 
 _nginx_conf_events() {
-    section_banner "nginx.conf — Events Block" "Applies to: events { } context"
+    while true; do
+        section_banner "nginx.conf — Events Block" "Applies to: events { } context"
 
-    local cur_conn; cur_conn=$(grep -m1 '^\s*worker_connections' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "1024")
-    local cur_multi; cur_multi=$(grep -m1 '^\s*multi_accept' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "off")
-    local cur_meth; cur_meth=$(grep -m1 '^\s*use\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "epoll")
+        local cur_conn cur_multi cur_meth
+        cur_conn=$(grep -m1 '^\s*worker_connections' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_multi=$(grep -m1 '^\s*multi_accept' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_meth=$(grep -m1 '^\s*use\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
 
-    echo -e "  ${DIM}worker_connections :${R} ${WHITE}${cur_conn}${R}"
-    echo -e "  ${DIM}multi_accept       :${R} ${WHITE}${cur_multi}${R}"
-    echo -e "  ${DIM}use (I/O method)   :${R} ${WHITE}${cur_meth}${R}"
-    blank
-    echo -e "  ${BLUE}  1)${R}  Set worker_connections"
-    echo -e "  ${BLUE}  2)${R}  Toggle multi_accept"
-    echo -e "  ${BLUE}  3)${R}  Set use (epoll/kqueue/select)"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+        echo -e "  ${DIM}worker_connections :${R} ${WHITE}${cur_conn:-1024}${R}"
+        echo -e "  ${DIM}multi_accept       :${R} ${WHITE}${cur_multi:-off}${R}"
+        echo -e "  ${DIM}use (I/O method)   :${R} ${WHITE}${cur_meth:-epoll}${R}"
+        blank
+        echo -e "  ${BLUE}  1)${R}  Set worker_connections"
+        echo -e "  ${BLUE}  2)${R}  Toggle multi_accept"
+        echo -e "  ${BLUE}  3)${R}  Set use (epoll/kqueue/select)"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-3]: "; IFS= read -r c
-    case "$c" in
-        1)
-            blank
-            echo -e "  ${BLUE}  1)${R}  512"
-            echo -e "  ${BLUE}  2)${R}  1024"
-            echo -e "  ${BLUE}  3)${R}  2048"
-            echo -e "  ${BLUE}  4)${R}  4096"
-            echo -e "  ${BLUE}  5)${R}  8192"
-            blank; hr; blank
-            local wc; menu_pick wc "512" "1024" "2048" "4096" "8192" || return
-            local connvals=("512" "1024" "2048" "4096" "8192")
-            local cv="${connvals[$((wc-1))]}"
-            _nginx_conf_set_param "worker_connections" "$cv" "events" "worker_connections"
-            ok "worker_connections set to ${cv}"
-            state_set "NGINX_WORKER_CONNECTIONS" "$cv"
-            ;;
-        2)
-            local new_ma; new_ma=$([[ "$cur_multi" == "on" ]] && echo "off" || echo "on")
-            _nginx_conf_set_param "multi_accept" "$new_ma" "events" "multi_accept"
-            ok "multi_accept set to ${new_ma}"
-            ;;
-        3)
-            local um; ask um "I/O method" "epoll" || return
-            _nginx_conf_set_param "use" "$um" "events" "io_method"
-            ok "use set to ${um}"
-            ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    sleep 0.6; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 3 || return
+        case "$c" in
+            1)
+                blank
+                echo -e "  ${BLUE}  1)${R}  512"
+                echo -e "  ${BLUE}  2)${R}  1024"
+                echo -e "  ${BLUE}  3)${R}  2048"
+                echo -e "  ${BLUE}  4)${R}  4096"
+                echo -e "  ${BLUE}  5)${R}  8192"
+                blank; hr; blank
+                local wc; menu_pick wc "512" "1024" "2048" "4096" "8192" || continue
+                local vals=("512" "1024" "2048" "4096" "8192")
+                local cv="${vals[$((wc-1))]}"
+                _nginx_conf_set_param "worker_connections" "$cv" "events" "worker_connections"
+                ok "worker_connections set to ${cv}"
+                state_set "NGINX_WORKER_CONNECTIONS" "$cv"
+                pause
+                ;;
+            2)
+                local new_ma
+                new_ma=$([[ "$cur_multi" == "on" ]] && echo "off" || echo "on")
+                _nginx_conf_set_param "multi_accept" "$new_ma" "events" "multi_accept"
+                ok "multi_accept set to ${new_ma}"
+                pause
+                ;;
+            3)
+                local um
+                if ask um "I/O method" "${cur_meth:-epoll}"; then
+                    _nginx_conf_set_param "use" "$um" "events" "io_method"
+                    ok "use set to ${um}"
+                    pause
+                fi
+                ;;
+            0) return ;;
+        esac
+    done
 }
 
 _nginx_conf_http() {
-    section_banner "nginx.conf — HTTP Block Global Settings" "Applies to: http { } context"
+    while true; do
+        section_banner "nginx.conf — HTTP Block Global Settings" "Applies to: http { } context"
 
-    local cur_st; cur_st=$(grep -m1 '^\s*server_tokens' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "on")
-    local cur_kb; cur_kb=$(grep -m1 '^\s*keepalive_timeout' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "65")
-    local cur_mb; cur_mb=$(grep -m1 '^\s*client_max_body_size' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "1m")
-    local cur_sn; cur_sn=$(grep -m1 '^\s*sendfile' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "on")
-    local cur_tcp; cur_tcp=$(grep -m1 '^\s*tcp_nopush' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "off")
-    local cur_types_hash; cur_types_hash=$(grep -m1 '^\s*types_hash_max_size' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "2048")
+        local cur_st cur_kb cur_mb cur_sn cur_tcp cur_th
+        cur_st=$(grep -m1 '^\s*server_tokens' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_kb=$(grep -m1 '^\s*keepalive_timeout' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_mb=$(grep -m1 '^\s*client_max_body_size' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_sn=$(grep -m1 '^\s*sendfile' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_tcp=$(grep -m1 '^\s*tcp_nopush' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_th=$(grep -m1 '^\s*types_hash_max_size' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
 
-    echo -e "  ${DIM}server_tokens       :${R} ${WHITE}${cur_st}${R}"
-    echo -e "  ${DIM}keepalive_timeout   :${R} ${WHITE}${cur_kb}${R}"
-    echo -e "  ${DIM}client_max_body_size:${R} ${WHITE}${cur_mb}${R}"
-    echo -e "  ${DIM}sendfile            :${R} ${WHITE}${cur_sn}${R}"
-    echo -e "  ${DIM}tcp_nopush          :${R} ${WHITE}${cur_tcp}${R}"
-    echo -e "  ${DIM}types_hash_max_size :${R} ${WHITE}${cur_types_hash}${R}"
-    blank
-    echo -e "  ${BLUE}  1)${R}  Toggle server_tokens"
-    echo -e "  ${BLUE}  2)${R}  Set keepalive_timeout"
-    echo -e "  ${BLUE}  3)${R}  Set client_max_body_size"
-    echo -e "  ${BLUE}  4)${R}  Toggle sendfile"
-    echo -e "  ${BLUE}  5)${R}  Toggle tcp_nopush"
-    echo -e "  ${BLUE}  6)${R}  Set types_hash_max_size"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+        echo -e "  ${DIM}server_tokens        :${R} ${WHITE}${cur_st:-on}${R}"
+        echo -e "  ${DIM}keepalive_timeout    :${R} ${WHITE}${cur_kb:-65}${R}"
+        echo -e "  ${DIM}client_max_body_size :${R} ${WHITE}${cur_mb:-1m}${R}"
+        echo -e "  ${DIM}sendfile             :${R} ${WHITE}${cur_sn:-on}${R}"
+        echo -e "  ${DIM}tcp_nopush           :${R} ${WHITE}${cur_tcp:-off}${R}"
+        echo -e "  ${DIM}types_hash_max_size  :${R} ${WHITE}${cur_th:-2048}${R}"
+        blank
+        echo -e "  ${BLUE}  1)${R}  Toggle server_tokens"
+        echo -e "  ${BLUE}  2)${R}  Set keepalive_timeout"
+        echo -e "  ${BLUE}  3)${R}  Set client_max_body_size"
+        echo -e "  ${BLUE}  4)${R}  Toggle sendfile"
+        echo -e "  ${BLUE}  5)${R}  Toggle tcp_nopush"
+        echo -e "  ${BLUE}  6)${R}  Set types_hash_max_size"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-6]: "; IFS= read -r c
-    case "$c" in
-        1)
-            local new_st; new_st=$([[ "$cur_st" == "off" ]] && echo "on" || echo "off")
-            _nginx_conf_set_param "server_tokens" "$new_st" "http" "server_tokens"
-            ok "server_tokens set to ${new_st}"; state_set "NGINX_SERVER_TOKENS" "$new_st" ;;
-        2)
-            local kt; ask kt "keepalive_timeout" "$cur_kb" || return
-            _nginx_conf_set_param "keepalive_timeout" "$kt" "http" "keepalive_timeout"
-            ok "keepalive_timeout set to ${kt}"; state_set "NGINX_KEEPALIVE_TIMEOUT" "$kt" ;;
-        3)
-            local mb; ask mb "client_max_body_size (e.g. 10m, 100m, 1g)" "$cur_mb" || return
-            _nginx_conf_set_param "client_max_body_size" "$mb" "http" "client_max_body_size"
-            ok "client_max_body_size set to ${mb}"; state_set "NGINX_CLIENT_MAX_BODY" "$mb" ;;
-        4)
-            local new_sf; new_sf=$([[ "$cur_sn" == "on" ]] && echo "off" || echo "on")
-            _nginx_conf_set_param "sendfile" "$new_sf" "http" "sendfile"
-            ok "sendfile set to ${new_sf}" ;;
-        5)
-            local new_tcp; new_tcp=$([[ "$cur_tcp" == "on" ]] && echo "off" || echo "on")
-            _nginx_conf_set_param "tcp_nopush" "$new_tcp" "http" "tcp_nopush"
-            ok "tcp_nopush set to ${new_tcp}" ;;
-        6)
-            local ths; ask ths "types_hash_max_size" "$cur_types_hash" || return
-            _nginx_conf_set_param "types_hash_max_size" "$ths" "http" "types_hash_max_size"
-            ok "types_hash_max_size set to ${ths}" ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    sleep 0.6; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 6 || return
+        case "$c" in
+            1)
+                local new_st; new_st=$([[ "$cur_st" == "off" ]] && echo "on" || echo "off")
+                _nginx_conf_set_param "server_tokens" "$new_st" "http" "server_tokens"
+                ok "server_tokens set to ${new_st}"
+                state_set "NGINX_SERVER_TOKENS" "$new_st"; pause ;;
+            2)
+                local kt
+                ask kt "keepalive_timeout" "${cur_kb:-65}" && {
+                    _nginx_conf_set_param "keepalive_timeout" "$kt" "http" "keepalive_timeout"
+                    ok "keepalive_timeout set to ${kt}"
+                    state_set "NGINX_KEEPALIVE_TIMEOUT" "$kt"; pause
+                } ;;
+            3)
+                local mb
+                ask mb "client_max_body_size (e.g. 10m, 100m, 1g)" "${cur_mb:-1m}" && {
+                    _nginx_conf_set_param "client_max_body_size" "$mb" "http" "client_max_body_size"
+                    ok "client_max_body_size set to ${mb}"
+                    state_set "NGINX_CLIENT_MAX_BODY" "$mb"; pause
+                } ;;
+            4)
+                local new_sf; new_sf=$([[ "$cur_sn" == "on" ]] && echo "off" || echo "on")
+                _nginx_conf_set_param "sendfile" "$new_sf" "http" "sendfile"
+                ok "sendfile set to ${new_sf}"; pause ;;
+            5)
+                local new_tcp; new_tcp=$([[ "$cur_tcp" == "on" ]] && echo "off" || echo "on")
+                _nginx_conf_set_param "tcp_nopush" "$new_tcp" "http" "tcp_nopush"
+                ok "tcp_nopush set to ${new_tcp}"; pause ;;
+            6)
+                local ths
+                ask ths "types_hash_max_size" "${cur_th:-2048}" && {
+                    _nginx_conf_set_param "types_hash_max_size" "$ths" "http" "types_hash_max_size"
+                    ok "types_hash_max_size set to ${ths}"; pause
+                } ;;
+            0) return ;;
+        esac
+    done
 }
 
 _nginx_conf_logformat() {
-    section_banner "nginx.conf — Log Formats" "Applies to: http { } context"
-    info "Current log_format directives:"
-    blank
-    grep -A2 'log_format' "$NGINX_CONF" 2>/dev/null | head -30 || echo -e "  ${DIM}none found${R}"
-    blank; hr; blank
-    echo -e "  ${BLUE}  1)${R}  Add combined_plus format  ${DIM}(combined + request_time, upstream)${R}"
-    echo -e "  ${BLUE}  2)${R}  Add json format           ${DIM}(structured JSON access log)${R}"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+    while true; do
+        section_banner "nginx.conf — Log Formats" "Applies to: http { } context"
+        info "Current log_format directives:"
+        blank
+        local lf; lf=$(grep -A2 'log_format' "$NGINX_CONF" 2>/dev/null | head -30)
+        if [[ -n "$lf" ]]; then
+            echo "$lf"
+        else
+            echo -e "  ${DIM}none found${R}"
+        fi
+        blank; hr; blank
+        echo -e "  ${BLUE}  1)${R}  Add combined_plus format  ${DIM}(combined + request_time, upstream)${R}"
+        echo -e "  ${BLUE}  2)${R}  Add json format           ${DIM}(structured JSON access log)${R}"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-2]: "; IFS= read -r c
-    case "$c" in
-        1)
-            if ! grep -q 'log_format combined_plus' "$NGINX_CONF" 2>/dev/null; then
-                _nginx_conf_backup "logformat_combined_plus" >/dev/null
-                sed -i '/^\s*http\s*{/a\    log_format combined_plus '"'"'$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" rt=$request_time urt=$upstream_response_time'"'"';' "$NGINX_CONF"
-                ok "log_format combined_plus added"
-                state_set "NGINX_LOG_FORMAT_COMBINED_PLUS" "1"
-                _log "nginx.conf log_format combined_plus added"
-            else
-                warn "log_format combined_plus already present"
-            fi ;;
-        2)
-            if ! grep -q 'log_format json' "$NGINX_CONF" 2>/dev/null; then
-                _nginx_conf_backup "logformat_json" >/dev/null
-                sed -i '/^\s*http\s*{/a\    log_format json escape=json '"'"'{"time":"$time_iso8601","ip":"$remote_addr","method":"$request_method","uri":"$request_uri","status":"$status","bytes":$body_bytes_sent,"rt":"$request_time","ua":"$http_user_agent"}'"'"';' "$NGINX_CONF"
-                ok "log_format json added"
-                state_set "NGINX_LOG_FORMAT_JSON" "1"
-                _log "nginx.conf log_format json added"
-            else
-                warn "log_format json already present"
-            fi ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    sleep 0.6; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 2 || return
+        case "$c" in
+            1)
+                if ! grep -q 'log_format combined_plus' "$NGINX_CONF" 2>/dev/null; then
+                    _nginx_conf_backup "logformat_combined_plus" >/dev/null
+                    sed -i '/^\s*http\s*{/a\    log_format combined_plus '"'"'$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" rt=$request_time urt=$upstream_response_time'"'"';' "$NGINX_CONF"
+                    ok "log_format combined_plus added"
+                    state_set "NGINX_LOG_FORMAT_COMBINED_PLUS" "1"
+                    _log "nginx.conf log_format combined_plus added"
+                else
+                    warn "log_format combined_plus already present"
+                fi
+                pause ;;
+            2)
+                if ! grep -q 'log_format json' "$NGINX_CONF" 2>/dev/null; then
+                    _nginx_conf_backup "logformat_json" >/dev/null
+                    sed -i '/^\s*http\s*{/a\    log_format json escape=json '"'"'{"time":"$time_iso8601","ip":"$remote_addr","method":"$request_method","uri":"$request_uri","status":"$status","bytes":$body_bytes_sent,"rt":"$request_time","ua":"$http_user_agent"}'"'"';' "$NGINX_CONF"
+                    ok "log_format json added"
+                    state_set "NGINX_LOG_FORMAT_JSON" "1"
+                    _log "nginx.conf log_format json added"
+                else
+                    warn "log_format json already present"
+                fi
+                pause ;;
+            0) return ;;
+        esac
+    done
 }
 
 _nginx_conf_gzip() {
-    section_banner "nginx.conf — Gzip Compression" "Applies to: http { } context"
+    while true; do
+        section_banner "nginx.conf — Gzip Compression" "Applies to: http { } context"
 
-    local cur_gz; cur_gz=$(grep -m1 '^\s*gzip\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "off")
-    local cur_lvl; cur_lvl=$(grep -m1 '^\s*gzip_comp_level' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "6")
-    local cur_min; cur_min=$(grep -m1 '^\s*gzip_min_length' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "1024")
-    local cur_vary; cur_vary=$(grep -m1 '^\s*gzip_vary' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "off")
-    local cur_prox; cur_prox=$(grep -m1 '^\s*gzip_proxied' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';' || echo "off")
+        local cur_gz cur_lvl cur_min cur_vary cur_prox
+        cur_gz=$(grep -m1 '^\s*gzip\s' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_lvl=$(grep -m1 '^\s*gzip_comp_level' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_min=$(grep -m1 '^\s*gzip_min_length' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_vary=$(grep -m1 '^\s*gzip_vary' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
+        cur_prox=$(grep -m1 '^\s*gzip_proxied' "$NGINX_CONF" 2>/dev/null | awk '{print $2}' | tr -d ';')
 
-    echo -e "  ${DIM}gzip             :${R} ${WHITE}${cur_gz}${R}"
-    echo -e "  ${DIM}gzip_comp_level  :${R} ${WHITE}${cur_lvl}${R}"
-    echo -e "  ${DIM}gzip_min_length  :${R} ${WHITE}${cur_min}${R}"
-    echo -e "  ${DIM}gzip_vary        :${R} ${WHITE}${cur_vary}${R}"
-    echo -e "  ${DIM}gzip_proxied     :${R} ${WHITE}${cur_prox}${R}"
-    blank
-    echo -e "  ${BLUE}  1)${R}  Toggle gzip"
-    echo -e "  ${BLUE}  2)${R}  Set gzip_comp_level  ${DIM}(1-9)${R}"
-    echo -e "  ${BLUE}  3)${R}  Set gzip_min_length"
-    echo -e "  ${BLUE}  4)${R}  Toggle gzip_vary"
-    echo -e "  ${BLUE}  5)${R}  Set gzip_proxied"
-    echo -e "  ${BLUE}  6)${R}  Apply recommended gzip settings"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+        echo -e "  ${DIM}gzip            :${R} ${WHITE}${cur_gz:-off}${R}"
+        echo -e "  ${DIM}gzip_comp_level :${R} ${WHITE}${cur_lvl:-6}${R}"
+        echo -e "  ${DIM}gzip_min_length :${R} ${WHITE}${cur_min:-1024}${R}"
+        echo -e "  ${DIM}gzip_vary       :${R} ${WHITE}${cur_vary:-off}${R}"
+        echo -e "  ${DIM}gzip_proxied    :${R} ${WHITE}${cur_prox:-off}${R}"
+        blank
+        echo -e "  ${BLUE}  1)${R}  Toggle gzip"
+        echo -e "  ${BLUE}  2)${R}  Set gzip_comp_level  ${DIM}(1-9)${R}"
+        echo -e "  ${BLUE}  3)${R}  Set gzip_min_length"
+        echo -e "  ${BLUE}  4)${R}  Toggle gzip_vary"
+        echo -e "  ${BLUE}  5)${R}  Set gzip_proxied"
+        echo -e "  ${BLUE}  6)${R}  Apply recommended gzip settings"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-6]: "; IFS= read -r c
-    case "$c" in
-        1)
-            local new_gz; new_gz=$([[ "$cur_gz" == "on" ]] && echo "off" || echo "on")
-            _nginx_conf_set_param "gzip" "$new_gz" "http" "gzip_toggle"
-            ok "gzip set to ${new_gz}"; state_set "NGINX_GZIP" "$new_gz" ;;
-        2)
-            blank
-            echo -e "  ${BLUE}  1)${R}  1  ${DIM}(fastest, least compression)${R}"
-            echo -e "  ${BLUE}  2)${R}  4  ${DIM}(balanced)${R}"
-            echo -e "  ${BLUE}  3)${R}  6  ${DIM}(default — recommended)${R}"
-            echo -e "  ${BLUE}  4)${R}  9  ${DIM}(maximum compression)${R}"
-            blank; hr; blank
-            local gl; menu_pick gl "1" "4" "6" "9" || return
-            local glvals=("1" "4" "6" "9"); local glv="${glvals[$((gl-1))]}"
-            _nginx_conf_set_param "gzip_comp_level" "$glv" "http" "gzip_comp_level"
-            ok "gzip_comp_level set to ${glv}"; state_set "NGINX_GZIP_LEVEL" "$glv" ;;
-        3)
-            local gml; ask gml "gzip_min_length" "$cur_min" || return
-            _nginx_conf_set_param "gzip_min_length" "$gml" "http" "gzip_min_length"
-            ok "gzip_min_length set to ${gml}" ;;
-        4)
-            local new_gv; new_gv=$([[ "$cur_vary" == "on" ]] && echo "off" || echo "on")
-            _nginx_conf_set_param "gzip_vary" "$new_gv" "http" "gzip_vary"
-            ok "gzip_vary set to ${new_gv}" ;;
-        5)
-            blank
-            echo -e "  ${BLUE}  1)${R}  off"
-            echo -e "  ${BLUE}  2)${R}  any"
-            echo -e "  ${BLUE}  3)${R}  no-cache"
-            echo -e "  ${BLUE}  4)${R}  expired"
-            blank; hr; blank
-            local gp; menu_pick gp "off" "any" "no-cache" "expired" || return
-            local gpvals=("off" "any" "no-cache" "expired"); local gpv="${gpvals[$((gp-1))]}"
-            _nginx_conf_set_param "gzip_proxied" "$gpv" "http" "gzip_proxied"
-            ok "gzip_proxied set to ${gpv}" ;;
-        6)
-            _nginx_conf_backup "gzip_recommended" >/dev/null
-            local recs=(
-                "gzip on"
-                "gzip_comp_level 6"
-                "gzip_min_length 1024"
-                "gzip_vary on"
-                "gzip_proxied any"
-                "gzip_types text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/atom+xml image/svg+xml"
-            )
-            for pair in "${recs[@]}"; do
-                local k v; k=$(echo "$pair" | awk '{print $1}'); v=$(echo "$pair" | cut -d' ' -f2-)
-                _nginx_conf_set_param "$k" "$v" "http" "gzip_recommended"
-            done
-            ok "Recommended gzip settings applied"
-            state_set "NGINX_GZIP" "on"; state_set "NGINX_GZIP_LEVEL" "6" ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    sleep 0.6; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 6 || return
+        case "$c" in
+            1)
+                local new_gz; new_gz=$([[ "$cur_gz" == "on" ]] && echo "off" || echo "on")
+                _nginx_conf_set_param "gzip" "$new_gz" "http" "gzip_toggle"
+                ok "gzip set to ${new_gz}"
+                state_set "NGINX_GZIP" "$new_gz"; pause ;;
+            2)
+                blank
+                echo -e "  ${BLUE}  1)${R}  1  ${DIM}(fastest, least compression)${R}"
+                echo -e "  ${BLUE}  2)${R}  4  ${DIM}(balanced)${R}"
+                echo -e "  ${BLUE}  3)${R}  6  ${DIM}(default — recommended)${R}"
+                echo -e "  ${BLUE}  4)${R}  9  ${DIM}(maximum compression)${R}"
+                blank; hr; blank
+                local gl; menu_pick gl "1" "4" "6" "9" || continue
+                local glvals=("1" "4" "6" "9"); local glv="${glvals[$((gl-1))]}"
+                _nginx_conf_set_param "gzip_comp_level" "$glv" "http" "gzip_comp_level"
+                ok "gzip_comp_level set to ${glv}"
+                state_set "NGINX_GZIP_LEVEL" "$glv"; pause ;;
+            3)
+                local gml
+                ask gml "gzip_min_length" "${cur_min:-1024}" && {
+                    _nginx_conf_set_param "gzip_min_length" "$gml" "http" "gzip_min_length"
+                    ok "gzip_min_length set to ${gml}"; pause
+                } ;;
+            4)
+                local new_gv; new_gv=$([[ "$cur_vary" == "on" ]] && echo "off" || echo "on")
+                _nginx_conf_set_param "gzip_vary" "$new_gv" "http" "gzip_vary"
+                ok "gzip_vary set to ${new_gv}"; pause ;;
+            5)
+                blank
+                echo -e "  ${BLUE}  1)${R}  off"
+                echo -e "  ${BLUE}  2)${R}  any"
+                echo -e "  ${BLUE}  3)${R}  no-cache"
+                echo -e "  ${BLUE}  4)${R}  expired"
+                blank; hr; blank
+                local gp; menu_pick gp "off" "any" "no-cache" "expired" || continue
+                local gpvals=("off" "any" "no-cache" "expired"); local gpv="${gpvals[$((gp-1))]}"
+                _nginx_conf_set_param "gzip_proxied" "$gpv" "http" "gzip_proxied"
+                ok "gzip_proxied set to ${gpv}"; pause ;;
+            6)
+                _nginx_conf_backup "gzip_recommended" >/dev/null
+                _nginx_conf_set_param "gzip" "on" "http" "gzip_recommended"
+                _nginx_conf_set_param "gzip_comp_level" "6" "http" "gzip_recommended"
+                _nginx_conf_set_param "gzip_min_length" "1024" "http" "gzip_recommended"
+                _nginx_conf_set_param "gzip_vary" "on" "http" "gzip_recommended"
+                _nginx_conf_set_param "gzip_proxied" "any" "http" "gzip_recommended"
+                _nginx_conf_set_param "gzip_types" "text/plain text/css text/xml text/javascript application/json application/javascript application/xml+rss application/atom+xml image/svg+xml" "http" "gzip_recommended"
+                ok "Recommended gzip settings applied"
+                state_set "NGINX_GZIP" "on"
+                state_set "NGINX_GZIP_LEVEL" "6"; pause ;;
+            0) return ;;
+        esac
+    done
 }
 
 _nginx_test_show() {
     section_banner "nginx — Configuration Test" ""
     nginx_test || true
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _nginx_apply() {
@@ -799,56 +866,66 @@ _nginx_apply() {
     if nginx_test; then
         blank
         if confirm "Reload nginx now?"; then
-            nginx_reload && ok "nginx reloaded." || err "Reload failed — check logs."
-            _log "nginx reloaded"
+            if nginx_reload; then
+                ok "nginx reloaded."
+                _log "nginx reloaded"
+            else
+                err "Reload failed — check logs."
+            fi
         fi
     else
         err "Configuration test failed — nginx NOT reloaded."
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _nginx_conf_history() {
-    section_banner "nginx.conf — Backup History" "${NGINX_CONF_BAK_DIR}"
-    local baks; baks=$(ls -lt "${NGINX_CONF_BAK_DIR}"/ 2>/dev/null | grep '^-' | head -20 || true)
-    if [[ -z "$baks" ]]; then
-        info "No backups found."
-    else
-        echo "$baks"
-        blank
-        if confirm "Restore a backup?"; then
-            blank
-            local i=1
-            declare -a bfiles=()
+    while true; do
+        section_banner "nginx.conf — Backup History" "${NGINX_CONF_BAK_DIR}"
+        local baks=()
+        if [[ -d "$NGINX_CONF_BAK_DIR" ]]; then
             while IFS= read -r line; do
-                local fname; fname=$(echo "$line" | awk '{print $NF}')
-                echo -e "  ${BLUE}  ${i})${R}  ${fname}"
-                bfiles+=("$fname")
-                (( i++ ))
-            done < <(ls -t "${NGINX_CONF_BAK_DIR}"/ 2>/dev/null | head -10)
-            blank; hr; blank
-            local bc; printf "  Select [1-%d]  (b = back): " "${#bfiles[@]}"; IFS= read -r bc
-            if [[ "$bc" =~ ^[0-9]+$ ]] && (( bc >= 1 && bc <= ${#bfiles[@]} )); then
-                local chosen="${bfiles[$((bc-1))]}"
-                _nginx_conf_backup "pre_restore" >/dev/null
-                cp "${NGINX_CONF_BAK_DIR}/${chosen}" "$NGINX_CONF"
-                ok "Restored from: ${chosen}"
-                _log "nginx.conf restored from ${chosen}"
-            fi
+                baks+=("$line")
+            done < <(ls -t "${NGINX_CONF_BAK_DIR}"/ 2>/dev/null | head -20)
         fi
-    fi
-    blank; read -rp "  Press Enter…" _
+
+        if [[ ${#baks[@]} -eq 0 ]]; then
+            info "No backups found."
+            pause; return
+        fi
+
+        local i=1
+        for b in "${baks[@]}"; do
+            echo -e "  ${BLUE}  $(printf '%2d' "$i"))${R}  ${b}"
+            (( i++ )) || true
+        done
+        blank; hr; blank
+        echo -e "  ${DIM}Enter number to restore, 0 or 'b' to go back${R}"
+        blank
+
+        local c; menu_choice c "Select" 0 "${#baks[@]}" || return
+        (( c == 0 )) && return
+
+        local chosen="${baks[$((c-1))]}"
+        if confirm "Restore from '${chosen}' ?"; then
+            _nginx_conf_backup "pre_restore" >/dev/null
+            cp "${NGINX_CONF_BAK_DIR}/${chosen}" "$NGINX_CONF"
+            ok "Restored from: ${chosen}"
+            _log "nginx.conf restored from ${chosen}"
+            pause
+            return
+        fi
+    done
 }
 
 # ==============================================================================
-#  SECTION: virtual hosts
+#  SITES section
 # ==============================================================================
 section_sites() {
     while true; do
         section_banner "VIRTUAL HOSTS" "${NGINX_CONFD}/"
 
-        local site_count; site_count=$(sites_list | wc -l)
-        echo -e "  ${DIM}Managed sites : ${WHITE}${site_count}${R}"
+        echo -e "  ${DIM}Managed sites : ${WHITE}$(sites_count)${R}"
         blank
         echo -e "  ${BLUE}  1)${R}  List all virtual hosts"
         echo -e "  ${BLUE}  2)${R}  Create new virtual host"
@@ -859,7 +936,7 @@ section_sites() {
         echo -e "  ${RED}  0)${R}  Back to main menu"
         blank; hr; blank
 
-        local c; printf "  Select [0-6]: "; IFS= read -r c
+        local c; menu_choice c "Select" 0 6 || return
         case "$c" in
             1) _sites_list_show ;;
             2) _site_create ;;
@@ -868,7 +945,6 @@ section_sites() {
             5) _site_delete ;;
             6) _sites_check_all ;;
             0) return ;;
-            *) warn "Invalid choice." ;;
         esac
     done
 }
@@ -879,27 +955,38 @@ _sites_list_show() {
     if [[ -z "$rows" ]]; then
         info "No managed virtual hosts yet."
     else
-        printf "  %-20s %-35s %-6s %-8s %s\n" "NAME" "SERVER_NAME" "PORT" "STATUS" "CONFIG FILE"
+        printf "  %-20s %-32s %-6s %-10s %s\n" "NAME" "SERVER_NAME" "PORT" "STATUS" "CONFIG"
         hr
-        while IFS='|' read -r name conf sn port cert key status ts; do
-            local fexists="?"
-            [[ -f "$conf" ]] && fexists="ok" || fexists="${RED}missing${R}"
-            printf "  %-20s %-35s %-6s " "$name" "$sn" "$port"
-            [[ "$status" == "enabled" ]] && printf "${GREEN}%-8s${R}" "$status" || printf "${YELLOW}%-8s${R}" "$status"
-            printf " %s %b\n" "$(basename "$conf")" "$fexists"
+        while IFS='|' read -r name conf sn port _ _ status _; do
+            [[ -z "$name" ]] && continue
+            local fstatus
+            if [[ -f "$conf" ]]; then
+                fstatus="ok"
+            elif [[ -f "${conf}.disabled" ]]; then
+                fstatus="disabled"
+            else
+                fstatus="missing"
+            fi
+            local sstr
+            case "$status" in
+                enabled)  sstr="${GREEN}enabled${R}" ;;
+                disabled) sstr="${YELLOW}disabled${R}" ;;
+                *)        sstr="${DIM}${status}${R}" ;;
+            esac
+            printf "  %-20s %-32s %-6s " "$name" "$sn" "$port"
+            # cannot use %-Ns with ANSI, so manual padding
+            printf "%b%*s %s\n" "$sstr" $((10 - ${#status})) "" "$(basename "$conf") [${fstatus}]"
         done <<< "$rows"
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _site_create() {
     section_banner "Create Virtual Host" "Config will be placed in ${NGINX_CONFD}/"
 
-    local name sn listen_port proxy_pass ssl_enable
-    ssl_enable="no"
+    local name sn listen_port
 
-    ask name "Site name (identifier, no spaces)" || return
-    # sanitize
+    if ! ask name "Site name (identifier, no spaces)"; then return; fi
     name="${name//[^a-zA-Z0-9_-]/_}"
 
     if [[ -f "${NGINX_CONFD}/${name}.conf" ]]; then
@@ -916,47 +1003,55 @@ _site_create() {
     echo -e "  ${BLUE}  4)${R}  HTTP redirect to HTTPS ${DIM}— redirect only${R}"
     blank; hr; blank
 
-    local stype; menu_pick stype "rp" "static" "rp_ssl" "redir" || return
-    local stypes=("rp" "static" "rp_ssl" "redir"); stype="${stypes[$((stype-1))]}"
+    local stype_idx; menu_pick stype_idx "rp" "static" "rp_ssl" "redir" || return
+    local stypes=("rp" "static" "rp_ssl" "redir")
+    local stype="${stypes[$((stype_idx-1))]}"
 
     blank
-    ask sn "server_name (domain or IP, e.g. example.com)" || return
-    ask listen_port "Listen port" "80" || return
+    if ! ask sn "server_name (domain or IP, e.g. example.com)"; then return; fi
+
+    local default_port="80"
+    [[ "$stype" == "rp_ssl" ]] && default_port="443"
+    if ! ask listen_port "Listen port" "$default_port"; then return; fi
 
     local conf_file="${NGINX_CONFD}/${name}.conf"
-    local cert_path="" key_path="" upstream_addr="" static_root=""
+    local cert_path="" key_path=""
+    local ssl_enable="no"
+    local upstream_addr="" static_root=""
 
     case "$stype" in
         rp|rp_ssl)
             local up_ip up_port
-            ask up_ip "Upstream IP address" || return
-            ask up_port "Upstream port" "3000" || return
+            if ! ask up_ip "Upstream IP address"; then return; fi
+            if ! ask up_port "Upstream port" "3000"; then return; fi
             upstream_addr="${up_ip}:${up_port}"
 
             if [[ "$stype" == "rp_ssl" ]]; then
                 ssl_enable="yes"
-                listen_port="443"
+                [[ "$listen_port" == "80" ]] && listen_port="443"
                 blank
                 cert_path=$(_pick_cert_path "Select certificate (.crt/.pem)") || return
+                [[ -z "$cert_path" ]] && { warn "No cert selected — aborting."; pause; return; }
+                blank
                 key_path=$(_pick_key_path "Select private key (.key)") || return
+                [[ -z "$key_path" ]] && { warn "No key selected — aborting."; pause; return; }
             fi
 
             _write_rp_conf "$conf_file" "$sn" "$listen_port" "$upstream_addr" \
                            "$ssl_enable" "$cert_path" "$key_path" "$name"
             ;;
         static)
-            ask static_root "Document root path" "/var/www/${name}" || return
+            if ! ask static_root "Document root path" "/var/www/${name}"; then return; fi
             mkdir -p "$static_root"
             _write_static_conf "$conf_file" "$sn" "$listen_port" "$static_root"
             ;;
         redir)
             local redir_to
-            ask redir_to "Redirect to URL" "https://${sn}" || return
+            if ! ask redir_to "Redirect to URL" "https://${sn}"; then return; fi
             _write_redir_conf "$conf_file" "$sn" "$listen_port" "$redir_to"
             ;;
     esac
 
-    # Register in DB
     site_add "$name" "$conf_file" "$sn" "$listen_port" "$cert_path" "$key_path" "enabled"
 
     blank; hr; blank
@@ -973,12 +1068,15 @@ _site_create() {
         err "nginx config test failed — check the generated file."
         warn "File: ${conf_file}"
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _write_rp_conf() {
     local conf="$1" sn="$2" port="$3" upstream="$4" ssl="$5" cert="$6" key="$7" uname="${8:-backend}"
     local up_name="${uname}_upstream"
+    local ssl_suffix=""
+    [[ "$ssl" == "yes" ]] && ssl_suffix=" ssl"
+
     cat > "$conf" <<EOF
 # pngxconf — reverse proxy — ${sn}
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
@@ -989,8 +1087,8 @@ upstream ${up_name} {
 }
 
 server {
-    listen      ${port}$([ "$ssl" = "yes" ] && echo " ssl" || echo "");
-    listen      [::]:${port}$([ "$ssl" = "yes" ] && echo " ssl" || echo "");
+    listen      ${port}${ssl_suffix};
+    listen      [::]:${port}${ssl_suffix};
     server_name ${sn};
 
     server_tokens off;
@@ -1088,83 +1186,103 @@ server {
 EOF
 }
 
+# ------------------------------------------------------------------------------
+# Cert/key pickers — return chosen path via stdout.
+# Use file descriptor 3 for UI to keep stdout clean.
+# ------------------------------------------------------------------------------
 _pick_cert_path() {
     local hint="${1:-Select certificate}"
-    blank
-    echo -e "  ${BOLD}${hint}${R}"
-    blank
+    exec 3>&1  # save stdout for return value
+    {
+        blank
+        echo -e "  ${BOLD}${hint}${R}"
+        blank
+    } >&2
 
     local certs_in_ssl=()
     if [[ -d "$NGINX_SSL_DIR" ]]; then
         while IFS= read -r -d '' f; do
             certs_in_ssl+=("$f")
-        done < <(find "$NGINX_SSL_DIR" -maxdepth 3 -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.cer" \) -print0 2>/dev/null || true)
+        done < <(find "$NGINX_SSL_DIR" -maxdepth 3 -type f \
+            \( -name "*.crt" -o -name "*.pem" -o -name "*.cer" \) -print0 2>/dev/null)
     fi
 
     local i=1
     for f in "${certs_in_ssl[@]}"; do
-        echo -e "  ${BLUE}  ${i})${R}  ${f}"
-        (( i++ ))
+        echo -e "  ${BLUE}  ${i})${R}  ${f}" >&2
+        (( i++ )) || true
     done
     local total=${#certs_in_ssl[@]}
-    echo -e "  ${BLUE}  $((total+1)))${R}  Enter path manually"
-    blank; hr; blank
+    echo -e "  ${BLUE}  $((total+1)))${R}  Enter path manually" >&2
+    echo "" >&2; hr >&2; echo "" >&2
 
-    local c; printf "  Select [1-%d]  (b = back): " "$((total+1))"; IFS= read -r c
-    if [[ "${c,,}" == "b" ]]; then NAV="back"; echo ""; return 1; fi
+    local c
+    printf "  Select [1-%d]  ${DIM}(b = back)${R}: " "$((total+1))" >&2
+    IFS= read -r c
+    if [[ "${c,,}" == "b" ]]; then NAV="back"; exec 3>&-; return 1; fi
     if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= total )); then
-        echo "${certs_in_ssl[$((c-1))]}"; return 0
-    elif (( c == total+1 )); then
+        printf '%s\n' "${certs_in_ssl[$((c-1))]}" >&3
+        exec 3>&-; return 0
+    elif [[ "$c" =~ ^[0-9]+$ ]] && (( c == total+1 )); then
         local manual_path
-        ask manual_path "Full path to certificate" || { echo ""; return 1; }
-        echo "$manual_path"; return 0
+        ask manual_path "Full path to certificate" || { exec 3>&-; return 1; }
+        printf '%s\n' "$manual_path" >&3
+        exec 3>&-; return 0
     fi
-    echo ""; return 1
+    exec 3>&-; return 1
 }
 
 _pick_key_path() {
     local hint="${1:-Select private key}"
-    blank
-    echo -e "  ${BOLD}${hint}${R}"
-    blank
+    exec 3>&1
+    {
+        blank
+        echo -e "  ${BOLD}${hint}${R}"
+        blank
+    } >&2
 
     local keys_in_ssl=()
     if [[ -d "$NGINX_SSL_DIR" ]]; then
         while IFS= read -r -d '' f; do
             keys_in_ssl+=("$f")
-        done < <(find "$NGINX_SSL_DIR" -maxdepth 3 -type f -name "*.key" -print0 2>/dev/null || true)
+        done < <(find "$NGINX_SSL_DIR" -maxdepth 3 -type f -name "*.key" -print0 2>/dev/null)
     fi
 
     local i=1
     for f in "${keys_in_ssl[@]}"; do
-        echo -e "  ${BLUE}  ${i})${R}  ${f}"
-        (( i++ ))
+        echo -e "  ${BLUE}  ${i})${R}  ${f}" >&2
+        (( i++ )) || true
     done
     local total=${#keys_in_ssl[@]}
-    echo -e "  ${BLUE}  $((total+1)))${R}  Enter path manually"
-    blank; hr; blank
+    echo -e "  ${BLUE}  $((total+1)))${R}  Enter path manually" >&2
+    echo "" >&2; hr >&2; echo "" >&2
 
-    local c; printf "  Select [1-%d]  (b = back): " "$((total+1))"; IFS= read -r c
-    if [[ "${c,,}" == "b" ]]; then NAV="back"; echo ""; return 1; fi
+    local c
+    printf "  Select [1-%d]  ${DIM}(b = back)${R}: " "$((total+1))" >&2
+    IFS= read -r c
+    if [[ "${c,,}" == "b" ]]; then NAV="back"; exec 3>&-; return 1; fi
     if [[ "$c" =~ ^[0-9]+$ ]] && (( c >= 1 && c <= total )); then
-        echo "${keys_in_ssl[$((c-1))]}"; return 0
-    elif (( c == total+1 )); then
+        printf '%s\n' "${keys_in_ssl[$((c-1))]}" >&3
+        exec 3>&-; return 0
+    elif [[ "$c" =~ ^[0-9]+$ ]] && (( c == total+1 )); then
         local manual_path
-        ask manual_path "Full path to private key" || { echo ""; return 1; }
-        echo "$manual_path"; return 0
+        ask manual_path "Full path to private key" || { exec 3>&-; return 1; }
+        printf '%s\n' "$manual_path" >&3
+        exec 3>&-; return 0
     fi
-    echo ""; return 1
+    exec 3>&-; return 1
 }
 
 _site_view() {
     section_banner "View Virtual Host Config" ""
     local rows; rows=$(sites_list)
-    [[ -z "$rows" ]] && { info "No sites."; read -rp "  Press Enter…" _; return; }
+    [[ -z "$rows" ]] && { info "No sites."; pause; return; }
 
     local i=1; declare -a names=()
     while IFS='|' read -r name _ sn port _ _ status _; do
+        [[ -z "$name" ]] && continue
         echo -e "  ${BLUE}  ${i})${R}  ${name}  ${DIM}(${sn}:${port} — ${status})${R}"
-        names+=("$name"); (( i++ ))
+        names+=("$name"); (( i++ )) || true
     done <<< "$rows"
     blank; hr; blank
 
@@ -1174,72 +1292,74 @@ _site_view() {
     blank
     if [[ -f "$cfile" ]]; then
         cat -n "$cfile"
+    elif [[ -f "${cfile}.disabled" ]]; then
+        info "Site is disabled:"
+        cat -n "${cfile}.disabled"
     else
         err "Config file not found: ${cfile}"
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _site_toggle() {
     section_banner "Enable / Disable Virtual Host" ""
     local rows; rows=$(sites_list)
-    [[ -z "$rows" ]] && { info "No sites."; read -rp "  Press Enter…" _; return; }
+    [[ -z "$rows" ]] && { info "No sites."; pause; return; }
 
     local i=1; declare -a names=()
     while IFS='|' read -r name _ sn _ _ _ status _; do
-        local badge; [[ "$status" == "enabled" ]] && badge="${GREEN}enabled${R}" || badge="${YELLOW}disabled${R}"
+        [[ -z "$name" ]] && continue
+        local badge
+        [[ "$status" == "enabled" ]] && badge="${GREEN}enabled${R}" || badge="${YELLOW}disabled${R}"
         echo -e "  ${BLUE}  ${i})${R}  ${name}  ${DIM}(${sn})${R}  — ${badge}"
-        names+=("$name"); (( i++ ))
+        names+=("$name"); (( i++ )) || true
     done <<< "$rows"
     blank; hr; blank
 
     local c; menu_pick c "${names[@]}" || return
     local chosen="${names[$((c-1))]}"
-    local cfile; cfile=$(site_get_field "$chosen" 2)
-    local cur_status; cur_status=$(site_get_field "$chosen" 7)
+    local cfile cur_status
+    cfile=$(site_get_field "$chosen" 2)
+    cur_status=$(site_get_field "$chosen" 7)
 
     if [[ "$cur_status" == "enabled" ]]; then
-        # disable: rename .conf to .conf.disabled
         if [[ -f "$cfile" ]]; then
             mv "$cfile" "${cfile}.disabled"
             ok "Disabled: ${cfile} → ${cfile}.disabled"
             _log "site disabled: ${chosen}"
         fi
-        # update DB
-        sed -i "s|^${chosen}|\(.*\)|\(.*\)|\(.*\)|\(.*\)|\(.*\)|\(.*\)|enabled||\1|\2|\3|\4|\5|\6|disabled||" "${PNGX_SITES_DB}" 2>/dev/null || \
-        awk -F'|' -v name="$chosen" 'BEGIN{OFS="|"} $1==name{$7="disabled"} {print}' "${PNGX_SITES_DB}" > "${PNGX_SITES_DB}.tmp" && \
-        mv "${PNGX_SITES_DB}.tmp" "${PNGX_SITES_DB}"
+        site_set_status "$chosen" "disabled"
     else
-        # enable: rename back
         if [[ -f "${cfile}.disabled" ]]; then
             mv "${cfile}.disabled" "$cfile"
             ok "Enabled: ${cfile}"
             _log "site enabled: ${chosen}"
         elif [[ -f "$cfile" ]]; then
-            ok "Config file already exists: ${cfile}"
+            ok "Config file already enabled: ${cfile}"
         else
             err "Config file not found: ${cfile}"
+            pause; return
         fi
-        awk -F'|' -v name="$chosen" 'BEGIN{OFS="|"} $1==name{$7="enabled"} {print}' "${PNGX_SITES_DB}" > "${PNGX_SITES_DB}.tmp" && \
-        mv "${PNGX_SITES_DB}.tmp" "${PNGX_SITES_DB}"
+        site_set_status "$chosen" "enabled"
     fi
 
     blank
     if confirm "Reload nginx?"; then
         nginx_reload && ok "nginx reloaded." || err "Reload failed."
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _site_delete() {
     section_banner "Delete Virtual Host" ""
     local rows; rows=$(sites_list)
-    [[ -z "$rows" ]] && { info "No sites."; read -rp "  Press Enter…" _; return; }
+    [[ -z "$rows" ]] && { info "No sites."; pause; return; }
 
     local i=1; declare -a names=()
     while IFS='|' read -r name _ sn _ _ _ _ _; do
+        [[ -z "$name" ]] && continue
         echo -e "  ${BLUE}  ${i})${R}  ${name}  ${DIM}(${sn})${R}"
-        names+=("$name"); (( i++ ))
+        names+=("$name"); (( i++ )) || true
     done <<< "$rows"
     blank; hr; blank
 
@@ -1249,7 +1369,7 @@ _site_delete() {
 
     blank
     warn "This will remove the config file and the DB record."
-    confirm "Delete '${chosen}'?" || { info "Cancelled."; read -rp "  Press Enter…" _; return; }
+    confirm "Delete '${chosen}'?" || { info "Cancelled."; pause; return; }
 
     [[ -f "$cfile" ]]          && { rm -f "$cfile";          ok "Removed: ${cfile}"; }
     [[ -f "${cfile}.disabled" ]] && { rm -f "${cfile}.disabled"; ok "Removed: ${cfile}.disabled"; }
@@ -1261,7 +1381,7 @@ _site_delete() {
     if confirm "Reload nginx?"; then
         nginx_reload && ok "nginx reloaded." || err "Reload failed."
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _sites_check_all() {
@@ -1270,15 +1390,21 @@ _sites_check_all() {
     if [[ -z "$rows" ]]; then
         info "No managed sites in database."
     else
-        while IFS='|' read -r name conf sn port cert key status _; do
+        while IFS='|' read -r name conf _ _ cert key _ _; do
+            [[ -z "$name" ]] && continue
             printf "  %-22s " "${name}:"
-            local ok_count=0 fail_count=0
-            [[ -f "$conf" ]] && { printf "${GREEN}conf${R} "; (( ok_count++ )); } || { printf "${RED}conf-missing${R} "; (( fail_count++ )); }
+            if [[ -f "$conf" ]]; then
+                printf "${GREEN}conf${R} "
+            elif [[ -f "${conf}.disabled" ]]; then
+                printf "${YELLOW}disabled${R} "
+            else
+                printf "${RED}conf-missing${R} "
+            fi
             if [[ -n "$cert" ]]; then
-                [[ -f "$cert" ]] && { printf "${GREEN}cert${R} "; (( ok_count++ )); } || { printf "${RED}cert-missing${R} "; (( fail_count++ )); }
+                [[ -f "$cert" ]] && printf "${GREEN}cert${R} " || printf "${RED}cert-missing${R} "
             fi
             if [[ -n "$key" ]]; then
-                [[ -f "$key" ]] && { printf "${GREEN}key${R} "; (( ok_count++ )); } || { printf "${RED}key-missing${R} "; (( fail_count++ )); }
+                [[ -f "$key" ]] && printf "${GREEN}key${R} " || printf "${RED}key-missing${R} "
             fi
             echo ""
         done <<< "$rows"
@@ -1287,18 +1413,17 @@ _sites_check_all() {
     info "Running nginx -t:"
     blank
     nginx_test || true
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 # ==============================================================================
-#  SECTION: SSL certificates
+#  SSL Certificates section
 # ==============================================================================
 section_certs() {
     while true; do
         section_banner "SSL CERTIFICATES" "${NGINX_SSL_DIR}/"
 
-        local cert_count; cert_count=$(certs_list | wc -l)
-        echo -e "  ${DIM}Known certificates : ${WHITE}${cert_count}${R}"
+        echo -e "  ${DIM}Known certificates : ${WHITE}$(certs_count)${R}"
         blank
         echo -e "  ${BLUE}  1)${R}  List all certificates"
         echo -e "  ${BLUE}  2)${R}  Create certificate  ${DIM}(via ssl-wizard.sh)${R}"
@@ -1309,7 +1434,7 @@ section_certs() {
         echo -e "  ${RED}  0)${R}  Back to main menu"
         blank; hr; blank
 
-        local c; printf "  Select [0-6]: "; IFS= read -r c
+        local c; menu_choice c "Select" 0 6 || return
         case "$c" in
             1) _certs_list_show ;;
             2) _cert_create_wizard ;;
@@ -1318,7 +1443,6 @@ section_certs() {
             5) _certs_check_expiry ;;
             6) _cert_remove ;;
             0) return ;;
-            *) warn "Invalid choice." ;;
         esac
     done
 }
@@ -1329,29 +1453,29 @@ _certs_list_show() {
     if [[ -z "$rows" ]]; then
         info "No registered certificates."
     else
-        printf "  %-20s %-30s %-6s %s\n" "NAME" "DOMAIN" "TYPE" "CERT PATH"
+        printf "  %-20s %-30s %-12s %s\n" "NAME" "DOMAIN" "TYPE" "EXPIRY / FILE"
         hr
-        while IFS='|' read -r name domain cert key chain type ts; do
-            local ex="?"
+        while IFS='|' read -r name domain cert _ _ type _; do
+            [[ -z "$name" ]] && continue
+            local exp
             if [[ -f "$cert" ]]; then
-                local exp; exp=$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2 || echo "?")
-                ex="${exp}"
+                exp=$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2)
+                [[ -z "$exp" ]] && exp="(unreadable)"
             else
-                ex="${RED}missing${R}"
+                exp="(cert missing)"
             fi
-            printf "  %-20s %-30s %-6s %s\n" "$name" "$domain" "$type" "$(basename "$cert") [exp: ${ex}]"
+            printf "  %-20s %-30s %-12s %s\n" "$name" "$domain" "$type" "$(basename "$cert") — $exp"
         done <<< "$rows"
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _cert_create_wizard() {
     local wizard; wizard=$(state_get "SSL_WIZARD_PATH")
     if [[ -z "$wizard" || ! -f "$wizard" ]]; then
-        # Search again
         for p in \
+            "$PNGX_SSL_WIZARD_DEFAULT" \
             "$(dirname "$(readlink -f "$0")")/ssl-wizard.sh" \
-            "/usr/local/lib/pngxconf/ssl-wizard.sh" \
             "${PNGX_STATE_DIR}/ssl-wizard.sh"
         do
             [[ -f "$p" ]] && { wizard="$p"; state_set "SSL_WIZARD_PATH" "$p"; break; }
@@ -1362,40 +1486,40 @@ _cert_create_wizard() {
         section_banner "SSL Wizard — Not Found" ""
         err "ssl-wizard.sh not found."
         blank
-        warn "Place ssl-wizard.sh in one of:"
-        echo -e "  ${DIM}/usr/local/lib/pngxconf/ssl-wizard.sh${R}"
+        warn "Expected locations:"
+        echo -e "  ${DIM}${PNGX_SSL_WIZARD_DEFAULT}${R}"
         echo -e "  ${DIM}${PNGX_STATE_DIR}/ssl-wizard.sh${R}"
-        echo -e "  ${DIM}same directory as pngxconf${R}"
         blank
-        # Offer manual path
         if confirm "Enter path to ssl-wizard.sh manually?"; then
-            local wp; ask wp "Full path to ssl-wizard.sh" || { read -rp "  Press Enter…" _; return; }
-            if [[ -f "$wp" ]]; then
-                state_set "SSL_WIZARD_PATH" "$wp"
-                wizard="$wp"
+            local wp
+            if ask wp "Full path to ssl-wizard.sh"; then
+                if [[ -f "$wp" ]]; then
+                    state_set "SSL_WIZARD_PATH" "$wp"; wizard="$wp"
+                else
+                    err "File not found: ${wp}"; pause; return
+                fi
             else
-                err "File not found: ${wp}"; read -rp "  Press Enter…" _; return
+                return
             fi
         else
-            read -rp "  Press Enter…" _; return
+            pause; return
         fi
     fi
 
-    # Run ssl-wizard.sh — it outputs to its own chosen S_OUTDIR
-    # After it exits, scan NGINX_SSL_DIR for new files and register them
-    local ssl_files_before
-    ssl_files_before=$(find "$NGINX_SSL_DIR" -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.key" \) 2>/dev/null | sort || true)
+    # Snapshot cert files before
+    local before_files
+    before_files=$(find "$NGINX_SSL_DIR" -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.key" \) 2>/dev/null | sort)
 
     bash "$wizard"
 
-    local ssl_files_after
-    ssl_files_after=$(find "$NGINX_SSL_DIR" -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.key" \) 2>/dev/null | sort || true)
+    local after_files
+    after_files=$(find "$NGINX_SSL_DIR" -type f \( -name "*.crt" -o -name "*.pem" -o -name "*.key" \) 2>/dev/null | sort)
 
     local new_files
-    new_files=$(comm -13 <(echo "$ssl_files_before") <(echo "$ssl_files_after") || true)
+    new_files=$(comm -13 <(echo "$before_files") <(echo "$after_files"))
 
     if [[ -n "$new_files" ]]; then
-        blank; hr
+        blank; hr; blank
         ok "New certificate files detected in ${NGINX_SSL_DIR}:"
         echo "$new_files"
         blank
@@ -1408,65 +1532,59 @@ _cert_create_wizard() {
 _cert_register_from_dir() {
     local dir="$1"
     section_banner "Register Certificates from Directory" "$dir"
-    local name domain cert key chain
 
-    # find .crt or fullchain.pem
     while IFS= read -r -d '' cfile; do
         [[ "$cfile" == *.key ]] && continue
         local base; base=$(basename "$cfile" | sed 's/_fullchain\.pem$//' | sed 's/\.crt$//' | sed 's/\.pem$//')
         info "Found: ${cfile}"
+        local name domain cert key chain
         ask name "Record name for this cert" "$base" || continue
         ask domain "Domain this cert covers" "$base" || continue
-
         cert="$cfile"
-        # find matching key
         key=""
         for kext in ".key" "_privkey.pem"; do
-            local try="${dir}/${base}${kext}"
+            local try="$(dirname "$cfile")/${base}${kext}"
             [[ -f "$try" ]] && { key="$try"; break; }
         done
         if [[ -z "$key" ]]; then
             ask_optional key "Path to private key (Enter to skip)" || true
         fi
-
         chain=""
-        local try_chain="${dir}/${base}_chain.pem"
+        local try_chain="$(dirname "$cfile")/${base}_chain.pem"
         [[ -f "$try_chain" ]] && chain="$try_chain"
-
         cert_add "$name" "$domain" "$cert" "$key" "$chain" "ssl-wizard"
         ok "Registered: ${name}"
-    done < <(find "$dir" -maxdepth 2 -type f \( -name "*.crt" -o -name "*fullchain*" \) -print0 2>/dev/null || true)
-    blank; read -rp "  Press Enter…" _
+    done < <(find "$dir" -maxdepth 3 -type f \( -name "*.crt" -o -name "*fullchain*" \) -print0 2>/dev/null)
+    pause
 }
 
 _cert_upload() {
     section_banner "Upload / Register Certificate" "Copies files to ${NGINX_SSL_DIR}/<domain>/"
     local name domain cert_src key_src chain_src
 
-    ask name "Record name (identifier)" || return
-    ask domain "Domain this certificate covers" || return
+    if ! ask name "Record name (identifier)"; then return; fi
+    if ! ask domain "Domain this certificate covers"; then return; fi
 
     local dest_dir="${NGINX_SSL_DIR}/${domain}"
     mkdir -p "$dest_dir"
     chmod 700 "$dest_dir"
 
-    # cert
-    blank; ask cert_src "Full path to certificate file (.crt or .pem)" || return
-    if [[ ! -f "$cert_src" ]]; then err "File not found: ${cert_src}"; read -rp "  Press Enter…" _; return; fi
+    blank
+    if ! ask cert_src "Full path to certificate file (.crt or .pem)"; then return; fi
+    if [[ ! -f "$cert_src" ]]; then err "File not found: ${cert_src}"; pause; return; fi
     local cert_dest="${dest_dir}/${domain}.crt"
     cp "$cert_src" "$cert_dest"
     chmod 644 "$cert_dest"
     ok "Certificate copied to: ${cert_dest}"
 
-    # key
-    blank; ask key_src "Full path to private key file (.key or .pem)" || return
-    if [[ ! -f "$key_src" ]]; then err "File not found: ${key_src}"; read -rp "  Press Enter…" _; return; fi
+    blank
+    if ! ask key_src "Full path to private key file (.key or .pem)"; then return; fi
+    if [[ ! -f "$key_src" ]]; then err "File not found: ${key_src}"; pause; return; fi
     local key_dest="${dest_dir}/${domain}.key"
     cp "$key_src" "$key_dest"
     chmod 600 "$key_dest"
     ok "Private key copied to: ${key_dest}"
 
-    # chain (optional)
     local chain_dest=""
     blank
     ask_optional chain_src "Path to chain/intermediate file (Enter to skip)" || true
@@ -1483,21 +1601,19 @@ _cert_upload() {
     info "key  : ${key_dest}"
     [[ -n "$chain_dest" ]] && info "chain: ${chain_dest}"
     _log "cert uploaded: name=${name} domain=${domain} cert=${cert_dest}"
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _cert_inspect() {
     section_banner "Inspect Certificate" ""
     local rows; rows=$(certs_list)
-    if [[ -z "$rows" ]]; then
-        info "No registered certificates."
-        read -rp "  Press Enter…" _; return
-    fi
+    if [[ -z "$rows" ]]; then info "No registered certificates."; pause; return; fi
 
     local i=1; declare -a names=()
     while IFS='|' read -r name domain _ _ _ _ _; do
+        [[ -z "$name" ]] && continue
         echo -e "  ${BLUE}  ${i})${R}  ${name}  ${DIM}(${domain})${R}"
-        names+=("$name"); (( i++ ))
+        names+=("$name"); (( i++ )) || true
     done <<< "$rows"
     blank; hr; blank
 
@@ -1526,30 +1642,31 @@ _cert_inspect() {
         openssl x509 -noout -serial -in "$cfile" 2>/dev/null || true
         hr
     fi
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _certs_check_expiry() {
     section_banner "Certificate Expiry Check" ""
     local rows; rows=$(certs_list)
-    if [[ -z "$rows" ]]; then
-        info "No registered certificates."
-        read -rp "  Press Enter…" _; return
-    fi
+    if [[ -z "$rows" ]]; then info "No registered certificates."; pause; return; fi
 
     local today; today=$(date +%s)
     while IFS='|' read -r name domain cert _ _ _ _; do
+        [[ -z "$name" ]] && continue
         printf "  %-22s %-32s " "$name" "$domain"
         if [[ ! -f "$cert" ]]; then
             printf "${RED}cert file missing${R}\n"; continue
         fi
-        local enddate; enddate=$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2 || echo "")
+        local enddate; enddate=$(openssl x509 -noout -enddate -in "$cert" 2>/dev/null | cut -d= -f2)
         if [[ -z "$enddate" ]]; then
             printf "${YELLOW}cannot read${R}\n"; continue
         fi
-        local exp_epoch; exp_epoch=$(date -d "$enddate" +%s 2>/dev/null || date -j -f "%b %d %T %Y %Z" "$enddate" +%s 2>/dev/null || echo 0)
+        local exp_epoch; exp_epoch=$(date -d "$enddate" +%s 2>/dev/null)
+        [[ -z "$exp_epoch" || "$exp_epoch" == "0" ]] && exp_epoch=0
         local days_left=$(( (exp_epoch - today) / 86400 ))
-        if (( days_left < 0 )); then
+        if (( exp_epoch == 0 )); then
+            printf "${YELLOW}cannot parse date${R}\n"
+        elif (( days_left < 0 )); then
             printf "${RED}EXPIRED %d days ago${R}\n" "$(( -days_left ))"
         elif (( days_left < 30 )); then
             printf "${YELLOW}expires in %d days${R}  [%s]\n" "$days_left" "$enddate"
@@ -1557,18 +1674,19 @@ _certs_check_expiry() {
             printf "${GREEN}valid %d days${R}  [%s]\n" "$days_left" "$enddate"
         fi
     done <<< "$rows"
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 _cert_remove() {
     section_banner "Remove Certificate Record" ""
     local rows; rows=$(certs_list)
-    [[ -z "$rows" ]] && { info "No registered certificates."; read -rp "  Press Enter…" _; return; }
+    [[ -z "$rows" ]] && { info "No registered certificates."; pause; return; }
 
     local i=1; declare -a names=()
     while IFS='|' read -r name domain _ _ _ _ _; do
+        [[ -z "$name" ]] && continue
         echo -e "  ${BLUE}  ${i})${R}  ${name}  ${DIM}(${domain})${R}"
-        names+=("$name"); (( i++ ))
+        names+=("$name"); (( i++ )) || true
     done <<< "$rows"
     blank; hr; blank
 
@@ -1577,99 +1695,109 @@ _cert_remove() {
 
     blank
     warn "Remove from database only (files on disk will NOT be deleted)."
-    confirm "Remove record '${chosen}'?" || { info "Cancelled."; read -rp "  Press Enter…" _; return; }
+    confirm "Remove record '${chosen}'?" || { info "Cancelled."; pause; return; }
     cert_remove "$chosen"
     ok "Record '${chosen}' removed."
     _log "cert record removed: ${chosen}"
-    blank; read -rp "  Press Enter…" _
+    pause
 }
 
 # ==============================================================================
-#  SECTION: System status
+#  System status
 # ==============================================================================
 section_status() {
     section_banner "SYSTEM STATUS" ""
 
     local nbin; nbin=$(nginx_bin)
     local nver; nver=$(nginx_version)
-    local running; running=$(nginx_is_running && echo "${GREEN}running${R}" || echo "${RED}stopped${R}")
+    local running_str
+    running_str=$(nginx_is_running && echo "${GREEN}running${R}" || echo "${RED}stopped${R}")
 
     echo -e "  ${DIM}nginx binary      :${R} ${WHITE}${nbin:-not found}${R}"
     echo -e "  ${DIM}nginx version     :${R} ${WHITE}${nver}${R}"
-    echo -e "  ${DIM}nginx status      :${R} ${running}"
+    echo -e "  ${DIM}nginx status      :${R} ${running_str}"
     blank
     echo -e "  ${DIM}nginx.conf        :${R} ${WHITE}${NGINX_CONF}${R}  $( [[ -f "$NGINX_CONF" ]] && echo "${GREEN}exists${R}" || echo "${RED}missing${R}" )"
     echo -e "  ${DIM}conf.d            :${R} ${WHITE}${NGINX_CONFD}${R}  $( [[ -d "$NGINX_CONFD" ]] && echo "${GREEN}exists${R}" || echo "${RED}missing${R}" )"
     echo -e "  ${DIM}ssl dir           :${R} ${WHITE}${NGINX_SSL_DIR}${R}  $( [[ -d "$NGINX_SSL_DIR" ]] && echo "${GREEN}exists${R}" || echo "${RED}missing${R}" )"
     blank
-    echo -e "  ${DIM}Managed sites     :${R} ${WHITE}$(sites_list | grep -c '.' || echo 0)${R}"
-    echo -e "  ${DIM}Registered certs  :${R} ${WHITE}$(certs_list | grep -c '.' || echo 0)${R}"
+    echo -e "  ${DIM}Managed sites     :${R} ${WHITE}$(sites_count)${R}"
+    echo -e "  ${DIM}Registered certs  :${R} ${WHITE}$(certs_count)${R}"
     echo -e "  ${DIM}State dir         :${R} ${WHITE}${PNGX_STATE_DIR}${R}"
-    echo -e "  ${DIM}Last nginx.conf edit :${R} ${WHITE}$(state_get "NGINX_CONF_LAST_EDIT" || echo "never")${R}"
-    echo -e "  ${DIM}First run date    :${R} ${WHITE}$(state_get "FIRST_RUN_DATE" || echo "never")${R}"
+    local last_edit; last_edit=$(state_get "NGINX_CONF_LAST_EDIT")
+    echo -e "  ${DIM}Last nginx.conf edit :${R} ${WHITE}${last_edit:-never}${R}"
+    local first_run; first_run=$(state_get "FIRST_RUN_DATE")
+    echo -e "  ${DIM}First run date    :${R} ${WHITE}${first_run:-never}${R}"
+    local wiz; wiz=$(state_get "SSL_WIZARD_PATH")
+    echo -e "  ${DIM}SSL wizard path   :${R} ${WHITE}${wiz:-not configured}${R}"
     blank; hr; blank
-    info "nginx -t output:"
-    blank
-    nginx_test || true
-    blank; read -rp "  Press Enter…" _
+    if [[ -n "$nbin" ]]; then
+        info "nginx -t output:"
+        blank
+        nginx_test || true
+    fi
+    pause
 }
 
 # ==============================================================================
-#  SECTION: nginx reload / restart
+#  nginx control
 # ==============================================================================
 section_nginx_ctrl() {
-    section_banner "nginx Control" ""
-    echo -e "  ${BLUE}  1)${R}  Test configuration   ${DIM}(nginx -t)${R}"
-    echo -e "  ${BLUE}  2)${R}  Reload               ${DIM}(graceful — keeps connections alive)${R}"
-    echo -e "  ${BLUE}  3)${R}  Restart              ${DIM}(full restart via systemctl)${R}"
-    echo -e "  ${BLUE}  4)${R}  Stop"
-    echo -e "  ${BLUE}  5)${R}  Start"
-    echo -e "  ${RED}  0)${R}  Back"
-    blank; hr; blank
+    while true; do
+        section_banner "nginx Control" ""
+        echo -e "  ${BLUE}  1)${R}  Test configuration   ${DIM}(nginx -t)${R}"
+        echo -e "  ${BLUE}  2)${R}  Reload               ${DIM}(graceful — keeps connections alive)${R}"
+        echo -e "  ${BLUE}  3)${R}  Restart              ${DIM}(full restart via systemctl)${R}"
+        echo -e "  ${BLUE}  4)${R}  Stop"
+        echo -e "  ${BLUE}  5)${R}  Start"
+        echo -e "  ${RED}  0)${R}  Back"
+        blank; hr; blank
 
-    local c; printf "  Select [0-5]: "; IFS= read -r c
-    case "$c" in
-        1)
-            blank; nginx_test || true ;;
-        2)
-            blank
-            if nginx_test &>/dev/null; then
-                nginx_reload && ok "nginx reloaded." || err "Reload failed."
-                _log "nginx reloaded"
-            else
-                err "Config test failed — not reloading."
-            fi ;;
-        3)
-            confirm "Restart nginx?" && {
-                systemctl restart nginx && ok "nginx restarted." || err "Restart failed."
-                _log "nginx restarted"
-            } ;;
-        4)
-            confirm "Stop nginx?" && {
-                systemctl stop nginx && ok "nginx stopped." || err "Stop failed."
-                _log "nginx stopped"
-            } ;;
-        5)
-            systemctl start nginx && ok "nginx started." || err "Start failed."
-            _log "nginx started" ;;
-        0) return ;;
-        *) warn "Invalid choice." ;;
-    esac
-    blank; read -rp "  Press Enter…" _
+        local c; menu_choice c "Select" 0 5 || return
+        case "$c" in
+            1) blank; nginx_test || true; pause ;;
+            2)
+                blank
+                if nginx_test &>/dev/null; then
+                    nginx_reload && ok "nginx reloaded." || err "Reload failed."
+                    _log "nginx reloaded"
+                else
+                    err "Config test failed — not reloading."
+                fi
+                pause ;;
+            3)
+                if confirm "Restart nginx?"; then
+                    systemctl restart nginx && ok "nginx restarted." || err "Restart failed."
+                    _log "nginx restarted"
+                fi
+                pause ;;
+            4)
+                if confirm "Stop nginx?"; then
+                    systemctl stop nginx && ok "nginx stopped." || err "Stop failed."
+                    _log "nginx stopped"
+                fi
+                pause ;;
+            5)
+                systemctl start nginx && ok "nginx started." || err "Start failed."
+                _log "nginx started"
+                pause ;;
+            0) return ;;
+        esac
+    done
 }
 
 # ==============================================================================
-#  MAIN MENU
+#  Main menu
 # ==============================================================================
 main_menu() {
     while true; do
         banner
         local running_str; running_str=$(nginx_is_running && echo "${GREEN}running${R}" || echo "${RED}stopped${R}")
         local nver; nver=$(state_get "NGINX_VERSION"); [[ -z "$nver" ]] && nver=$(nginx_version)
-        local site_c; site_c=$(sites_list | grep -c '.' 2>/dev/null || echo 0)
-        local cert_c; cert_c=$(certs_list | grep -c '.' 2>/dev/null || echo 0)
+        local sc; sc=$(sites_count)
+        local cc; cc=$(certs_count)
 
-        echo -e "  ${DIM}nginx ${nver}  │  status: ${running_str}  │  sites: ${WHITE}${site_c}${R}${DIM}  │  certs: ${WHITE}${cert_c}${R}"
+        echo -e "  ${DIM}nginx ${nver}  │  status: ${running_str}  ${DIM}│  sites: ${WHITE}${sc}${R}${DIM}  │  certs: ${WHITE}${cc}${R}"
         blank; hr; blank
 
         echo -e "  ${BOLD}${CYAN}  1)${R}  nginx.conf Management      ${DIM}— workers, http, gzip, log formats${R}"
@@ -1680,19 +1808,21 @@ main_menu() {
         echo -e "  ${RED}  0)${R}  Exit"
         blank; hr; blank
 
-        local c; printf "  Select [0-5]: "; IFS= read -r c
+        local c
+        printf "  Select [0-5]: "
+        IFS= read -r c
         case "$c" in
             1) section_nginx_conf ;;
             2) section_sites ;;
             3) section_certs ;;
             4) section_nginx_ctrl ;;
             5) section_status ;;
-            0)
+            0|q|Q)
                 blank
                 info "Exiting pngxconf."
                 blank
                 exit 0 ;;
-            *) warn "Invalid choice." ;;
+            *) warn "Invalid choice." ; sleep 0.5 ;;
         esac
     done
 }
@@ -1711,7 +1841,8 @@ case "${1:-}" in
         ;;
     *)
         err "Unknown argument: $1"
-        echo "  Usage: pngxconf  |  pngxconf -h"
+        echo "  Usage: pngxconf           (launch TUI)"
+        echo "         pngxconf -h        (help)"
         exit 1
         ;;
 esac
