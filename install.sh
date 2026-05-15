@@ -4,7 +4,7 @@
 #  Installs pngxconf and ssl-wizard.sh to standard system locations
 #  Run as root: sudo bash install.sh
 # ==============================================================================
-set -euo pipefail
+set -uo pipefail
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 R=$'\033[0m'
@@ -21,8 +21,15 @@ info()  { echo -e "${CYAN}  ●${R} $*"; }
 ok()    { echo -e "${GREEN}  ✔${R} $*"; }
 warn()  { echo -e "${YELLOW}  ⚠${R} $*"; }
 err()   { echo -e "${RED}  ✖${R} $*" >&2; }
-die()   { err "$*"; exit 1; }
+die()   { err "$*"; pause_err; exit 1; }
 hr()    { echo -e "${DIM}  $(printf '%.0s─' {1..62})${R}"; }
+
+# stop on error — wait for keypress
+pause_err() {
+    echo ""
+    echo -e "  ${YELLOW}── Press any key to continue ──${R}"
+    read -rsn1 _
+}
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 readonly BIN_DIR="/usr/local/bin"
@@ -39,7 +46,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 banner() {
-    clear
+    clear 2>/dev/null || printf '\033[2J\033[H'
     echo ""
     echo -e "  ${BOLD}${BLUE}╔══════════════════════════════════════════════════════════╗${R}"
     echo -e "  ${BOLD}${BLUE}║${R}  ${BOLD}${WHITE}pngxconf installer${R}                                    ${BOLD}${BLUE}║${R}"
@@ -50,12 +57,16 @@ banner() {
 
 # ── Root check ────────────────────────────────────────────────────────────────
 require_root() {
-    [[ $EUID -eq 0 ]] || die "Installer must be run as root.  Try: sudo bash install.sh"
+    [[ $EUID -eq 0 ]] || die "Installer must be run as root. Try: sudo bash install.sh"
 }
 
 # ── Distro detection ──────────────────────────────────────────────────────────
 DISTRO="unknown"
 DISTRO_FAMILY="unknown"
+PKG_MGR=""
+PKG_INSTALL=""
+PKG_UPDATE=""
+PKG_QUERY=""
 
 detect_distro() {
     if [[ -f /etc/os-release ]]; then
@@ -63,107 +74,119 @@ detect_distro() {
         source /etc/os-release
         DISTRO="${NAME:-Unknown}"
         case "${ID:-}" in
-            ubuntu|debian|linuxmint|pop|kali|raspbian) DISTRO_FAMILY="debian" ;;
-            rhel|centos|fedora|rocky|almalinux|ol|amzn) DISTRO_FAMILY="rhel" ;;
-            arch|manjaro|endeavouros) DISTRO_FAMILY="arch" ;;
-            opensuse*|sles) DISTRO_FAMILY="suse" ;;
+            ubuntu|debian|linuxmint|pop|kali|raspbian)
+                DISTRO_FAMILY="debian"
+                PKG_MGR="apt"
+                PKG_INSTALL="apt-get install -y"
+                PKG_UPDATE="apt-get update"
+                PKG_QUERY="dpkg -s"
+                ;;
+            rhel|centos|fedora|rocky|almalinux|ol|amzn)
+                DISTRO_FAMILY="rhel"
+                if command -v dnf &>/dev/null; then
+                    PKG_MGR="dnf"
+                    PKG_INSTALL="dnf install -y"
+                    PKG_UPDATE="dnf check-update || true"
+                else
+                    PKG_MGR="yum"
+                    PKG_INSTALL="yum install -y"
+                    PKG_UPDATE="yum check-update || true"
+                fi
+                PKG_QUERY="rpm -q"
+                ;;
+            arch|manjaro|endeavouros)
+                DISTRO_FAMILY="arch"
+                PKG_MGR="pacman"
+                PKG_INSTALL="pacman -S --noconfirm"
+                PKG_UPDATE="pacman -Sy"
+                PKG_QUERY="pacman -Qi"
+                ;;
+            opensuse*|sles)
+                DISTRO_FAMILY="suse"
+                PKG_MGR="zypper"
+                PKG_INSTALL="zypper install -y"
+                PKG_UPDATE="zypper refresh"
+                PKG_QUERY="rpm -q"
+                ;;
             *) DISTRO_FAMILY="unknown" ;;
         esac
     fi
 }
 
-# ── Check prerequisites ───────────────────────────────────────────────────────
-check_prereqs() {
-    echo -e "  ${BOLD}Checking prerequisites…${R}"
-    hr; echo ""
-
-    local missing=()
-
-    # bash version
-    local bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
-    if (( BASH_VERSINFO[0] >= 4 )); then
-        ok "bash           ${bash_ver}"
-    else
-        err "bash           ${bash_ver}  (need 4.0+)"
-        missing+=("bash")
-    fi
-
-    # openssl
-    if command -v openssl &>/dev/null; then
-        ok "openssl        $(openssl version | awk '{print $2}')"
-    else
-        warn "openssl        not found — will attempt install"
-        missing+=("openssl")
-    fi
-
-    # nginx
-    if command -v nginx &>/dev/null; then
-        local nver; nver=$(nginx -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1)
-        ok "nginx          ${nver}"
-    else
-        warn "nginx          not found — required for pngxconf to operate"
-        missing+=("nginx")
-    fi
-
-    # curl (required by ssl-wizard for acme.sh)
-    if command -v curl &>/dev/null; then
-        ok "curl           $(curl --version | head -1 | awk '{print $2}')"
-    else
-        warn "curl           not found — will attempt install"
-        missing+=("curl")
-    fi
-
-    # socat (optional, for ssl-wizard standalone mode)
-    if command -v socat &>/dev/null; then
-        ok "socat          found"
-    else
-        warn "socat          not found  ${DIM}(optional — for acme.sh standalone)${R}"
-    fi
-
-    echo ""
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        warn "Missing packages: ${missing[*]}"
-        echo ""
-        if prompt_yn "Attempt to install missing packages now?"; then
-            install_missing "${missing[@]}"
-        else
-            warn "Continuing without installing. pngxconf may not function correctly."
-        fi
-    fi
-    echo ""
-}
-
-install_missing() {
-    local pkgs=("$@")
+# ── Package map per distro ────────────────────────────────────────────────────
+# Map generic name → package name for the current distro
+pkg_name() {
+    local generic="$1"
     case "$DISTRO_FAMILY" in
         debian)
-            info "Running: apt-get update && apt-get install -y ${pkgs[*]}"
-            apt-get update && apt-get install -y "${pkgs[@]}"
-            ;;
+            case "$generic" in
+                nginx)    echo "nginx" ;;
+                openssl)  echo "openssl" ;;
+                curl)     echo "curl" ;;
+                socat)    echo "socat" ;;
+                cron)     echo "cron" ;;
+                acme.sh)  echo "" ;;   # not in repos for Debian/Ubuntu; we install via official installer
+                *)        echo "$generic" ;;
+            esac ;;
         rhel)
-            if command -v dnf &>/dev/null; then
-                info "Running: dnf install -y ${pkgs[*]}"
-                dnf install -y "${pkgs[@]}"
-            else
-                info "Running: yum install -y ${pkgs[*]}"
-                yum install -y "${pkgs[@]}"
-            fi
-            ;;
+            case "$generic" in
+                nginx)    echo "nginx" ;;
+                openssl)  echo "openssl" ;;
+                curl)     echo "curl" ;;
+                socat)    echo "socat" ;;
+                cron)     echo "cronie" ;;
+                acme.sh)  echo "" ;;
+                *)        echo "$generic" ;;
+            esac ;;
         arch)
-            info "Running: pacman -Sy --noconfirm ${pkgs[*]}"
-            pacman -Sy --noconfirm "${pkgs[@]}"
-            ;;
+            case "$generic" in
+                nginx)    echo "nginx" ;;
+                openssl)  echo "openssl" ;;
+                curl)     echo "curl" ;;
+                socat)    echo "socat" ;;
+                cron)     echo "cronie" ;;
+                acme.sh)  echo "acme.sh" ;;  # in AUR — likely fails; fallback to manual
+                *)        echo "$generic" ;;
+            esac ;;
         suse)
-            info "Running: zypper install -y ${pkgs[*]}"
-            zypper install -y "${pkgs[@]}"
-            ;;
-        *)
-            err "Unknown distribution — cannot auto-install. Please install manually: ${pkgs[*]}"
-            return 1
-            ;;
+            case "$generic" in
+                nginx)    echo "nginx" ;;
+                openssl)  echo "openssl" ;;
+                curl)     echo "curl" ;;
+                socat)    echo "socat" ;;
+                cron)     echo "cron" ;;
+                acme.sh)  echo "" ;;
+                *)        echo "$generic" ;;
+            esac ;;
+        *) echo "$generic" ;;
     esac
 }
 
+# Check if a package is installed using the native package manager
+pkg_is_installed() {
+    local pkg="$1"
+    [[ -z "$pkg" ]] && return 1
+    case "$DISTRO_FAMILY" in
+        debian) dpkg -s "$pkg" &>/dev/null ;;
+        rhel|suse) rpm -q "$pkg" &>/dev/null ;;
+        arch) pacman -Qi "$pkg" &>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+
+# Run install via native manager
+pkg_install() {
+    local pkgs=("$@")
+    [[ ${#pkgs[@]} -eq 0 ]] && return 0
+    info "Running: ${PKG_INSTALL} ${pkgs[*]}"
+    eval "$PKG_INSTALL ${pkgs[*]}" || {
+        err "Package installation failed: ${pkgs[*]}"
+        pause_err
+        return 1
+    }
+}
+
+# ── Yes/No prompt ─────────────────────────────────────────────────────────────
 prompt_yn() {
     local prompt="${1:-Proceed?}"
     local ans
@@ -173,12 +196,299 @@ prompt_yn() {
     [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]
 }
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Prerequisite check via NATIVE package manager (not GitHub)
+# ══════════════════════════════════════════════════════════════════════════════
+check_prereqs() {
+    echo -e "  ${BOLD}Checking prerequisites via ${PKG_MGR}…${R}"
+    hr; echo ""
+
+    # bash version is checked at script level, not via pkg
+    local bash_ver="${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+    if (( BASH_VERSINFO[0] >= 4 )); then
+        ok "bash           ${bash_ver}"
+    else
+        err "bash           ${bash_ver}  (need 4.0+)"
+        pause_err
+    fi
+
+    # Track packages needed
+    local need_install=()
+    local optional_missing=()
+
+    # === Required packages ===
+    _check_pkg() {
+        local generic="$1" required="${2:-yes}"
+        local pkg; pkg=$(pkg_name "$generic")
+
+        if [[ -z "$pkg" ]]; then
+            # Means handled separately (acme.sh)
+            return 0
+        fi
+
+        if pkg_is_installed "$pkg"; then
+            local ver=""
+            case "$DISTRO_FAMILY" in
+                debian) ver=$(dpkg -s "$pkg" 2>/dev/null | grep '^Version:' | awk '{print $2}') ;;
+                rhel|suse) ver=$(rpm -q --qf '%{VERSION}' "$pkg" 2>/dev/null) ;;
+                arch) ver=$(pacman -Qi "$pkg" 2>/dev/null | grep '^Version' | awk '{print $3}') ;;
+            esac
+            printf "  ${GREEN}  ✔${R} %-15s ${DIM}%s${R}  (pkg: %s)\n" "$generic" "${ver:-installed}" "$pkg"
+        else
+            if [[ "$required" == "yes" ]]; then
+                printf "  ${YELLOW}  ⚠${R} %-15s ${RED}not installed${R}  (pkg: %s)\n" "$generic" "$pkg"
+                need_install+=("$pkg")
+            else
+                printf "  ${YELLOW}  ⚠${R} %-15s ${DIM}not installed (optional)${R}  (pkg: %s)\n" "$generic" "$pkg"
+                optional_missing+=("$pkg")
+            fi
+        fi
+    }
+
+    _check_pkg "nginx"   "yes"
+    _check_pkg "openssl" "yes"
+    _check_pkg "curl"    "yes"
+    _check_pkg "cron"    "yes"
+    _check_pkg "socat"   "no"
+
+    echo ""
+
+    # === Install required missing ===
+    if [[ ${#need_install[@]} -gt 0 ]]; then
+        warn "Required packages missing: ${need_install[*]}"
+        echo ""
+        if prompt_yn "Install required packages now?"; then
+            info "Updating package index…"
+            eval "$PKG_UPDATE" || warn "Package index update returned non-zero — continuing anyway"
+            echo ""
+            pkg_install "${need_install[@]}" || die "Required package installation failed"
+        else
+            warn "Continuing without required packages. pngxconf functionality will be limited."
+            pause_err
+        fi
+        echo ""
+    fi
+
+    # === Optional packages ===
+    if [[ ${#optional_missing[@]} -gt 0 ]]; then
+        info "Optional packages not installed: ${optional_missing[*]}"
+        echo "  ${DIM}socat is needed for acme.sh standalone mode${R}"
+        if prompt_yn "Install optional packages now?"; then
+            pkg_install "${optional_missing[@]}" || warn "Optional install failed — continuing"
+        fi
+        echo ""
+    fi
+
+    # === acme.sh check ===
+    check_acme_sh
+
+    # === Firewall check (port 80 for acme.sh) ===
+    check_firewall
+}
+
+# ── acme.sh check ─────────────────────────────────────────────────────────────
+check_acme_sh() {
+    echo -e "  ${BOLD}Checking acme.sh…${R}"
+    hr; echo ""
+
+    local acme_bin=""
+    for p in /root/.acme.sh/acme.sh /usr/local/bin/acme.sh; do
+        [[ -f "$p" ]] && { acme_bin="$p"; break; }
+    done
+
+    if [[ -n "$acme_bin" ]]; then
+        local ver; ver=$("$acme_bin" --version 2>/dev/null | head -1)
+        ok "acme.sh        ${ver:-installed}  ${DIM}(${acme_bin})${R}"
+    else
+        warn "acme.sh        not installed"
+
+        # Try native package first
+        local native_pkg; native_pkg=$(pkg_name "acme.sh")
+        if [[ -n "$native_pkg" ]]; then
+            info "Available in repository as: ${native_pkg}"
+            if prompt_yn "Install acme.sh via ${PKG_MGR}?"; then
+                pkg_install "$native_pkg" && return 0
+            fi
+        fi
+
+        # Fallback to official installer (only if user agrees)
+        echo ""
+        warn "acme.sh is not packaged for ${DISTRO_FAMILY} in standard repos."
+        info "The official installer fetches from get.acme.sh and installs to /root/.acme.sh/"
+        if prompt_yn "Run the official acme.sh installer?"; then
+            install_acme_sh_official
+        else
+            warn "Skipping acme.sh. Let's Encrypt automation via ssl-wizard will be unavailable."
+        fi
+    fi
+    echo ""
+}
+
+install_acme_sh_official() {
+    if ! command -v curl &>/dev/null; then
+        err "curl is required to install acme.sh"
+        pause_err
+        return 1
+    fi
+    info "Downloading and running acme.sh installer…"
+    curl -fsSL https://get.acme.sh -o /tmp/acme-install.sh || {
+        err "Failed to download acme.sh installer"
+        pause_err
+        return 1
+    }
+    bash /tmp/acme-install.sh --install -m "admin@$(hostname -f 2>/dev/null || hostname)" || {
+        err "acme.sh installation failed"
+        rm -f /tmp/acme-install.sh
+        pause_err
+        return 1
+    }
+    rm -f /tmp/acme-install.sh
+    ok "acme.sh installed to /root/.acme.sh/"
+
+    # Ensure cron entry exists
+    if command -v crontab &>/dev/null; then
+        if crontab -l 2>/dev/null | grep -q 'acme.sh'; then
+            ok "acme.sh cron entry already present"
+        else
+            warn "acme.sh installer should have added a cron entry — verifying"
+            crontab -l 2>/dev/null || true
+        fi
+    fi
+}
+
+# ── Firewall check for acme.sh port 80 ────────────────────────────────────────
+check_firewall() {
+    echo -e "  ${BOLD}Checking firewall (port 80 for acme.sh HTTP-01)…${R}"
+    hr; echo ""
+
+    local issues=0
+
+    # ufw
+    if command -v ufw &>/dev/null; then
+        local ufw_status; ufw_status=$(ufw status 2>/dev/null | head -1)
+        if echo "$ufw_status" | grep -qi 'active'; then
+            info "ufw is active"
+            if ufw status 2>/dev/null | grep -qE '^80(/tcp)?\s+ALLOW' ; then
+                ok "ufw — port 80 is open"
+            else
+                warn "ufw — port 80 appears NOT to be allowed"
+                if prompt_yn "Open port 80 in ufw?"; then
+                    ufw allow 80/tcp && ok "Port 80 opened in ufw" || { err "ufw allow failed"; issues=$((issues+1)); }
+                fi
+            fi
+            # Same for 443 since HTTPS will be needed after cert issuance
+            if ufw status 2>/dev/null | grep -qE '^443(/tcp)?\s+ALLOW' ; then
+                ok "ufw — port 443 is open"
+            else
+                warn "ufw — port 443 NOT allowed"
+                if prompt_yn "Open port 443 in ufw?"; then
+                    ufw allow 443/tcp && ok "Port 443 opened in ufw" || { err "ufw allow failed"; issues=$((issues+1)); }
+                fi
+            fi
+        else
+            ok "ufw installed but inactive — ports unrestricted by ufw"
+        fi
+    fi
+
+    # firewalld
+    if command -v firewall-cmd &>/dev/null; then
+        if systemctl is-active --quiet firewalld 2>/dev/null; then
+            info "firewalld is active"
+            local zone; zone=$(firewall-cmd --get-default-zone 2>/dev/null)
+            if firewall-cmd --list-ports 2>/dev/null | grep -q '80/tcp' || \
+               firewall-cmd --list-services 2>/dev/null | grep -qw 'http'; then
+                ok "firewalld — port 80 / http open (zone: ${zone})"
+            else
+                warn "firewalld — port 80 not open in zone '${zone}'"
+                if prompt_yn "Open port 80 (and http service) in firewalld?"; then
+                    firewall-cmd --permanent --add-service=http && \
+                    firewall-cmd --permanent --add-port=80/tcp && \
+                    firewall-cmd --reload && ok "Port 80 opened" || { err "firewall-cmd failed"; issues=$((issues+1)); }
+                fi
+            fi
+            if firewall-cmd --list-ports 2>/dev/null | grep -q '443/tcp' || \
+               firewall-cmd --list-services 2>/dev/null | grep -qw 'https'; then
+                ok "firewalld — port 443 / https open"
+            else
+                warn "firewalld — port 443 not open"
+                if prompt_yn "Open port 443 in firewalld?"; then
+                    firewall-cmd --permanent --add-service=https && \
+                    firewall-cmd --permanent --add-port=443/tcp && \
+                    firewall-cmd --reload && ok "Port 443 opened" || { err "firewall-cmd failed"; issues=$((issues+1)); }
+                fi
+            fi
+        else
+            ok "firewalld installed but inactive"
+        fi
+    fi
+
+    # iptables fallback
+    if ! command -v ufw &>/dev/null && ! command -v firewall-cmd &>/dev/null && command -v iptables &>/dev/null; then
+        info "Only iptables detected"
+        if iptables -L INPUT -n 2>/dev/null | grep -qE 'dpt:80\s'; then
+            local action; action=$(iptables -L INPUT -n | grep -E 'dpt:80\s' | head -1 | awk '{print $1}')
+            if [[ "$action" == "ACCEPT" ]]; then
+                ok "iptables — port 80 ACCEPT rule found"
+            else
+                warn "iptables — port 80 has ${action} rule"
+                issues=$((issues+1))
+            fi
+        else
+            warn "iptables — no explicit rule for port 80 (default policy applies)"
+            echo "  ${DIM}If default policy is DROP, acme.sh HTTP-01 challenge will fail${R}"
+        fi
+    fi
+
+    # No firewall at all
+    if ! command -v ufw &>/dev/null && \
+       ! command -v firewall-cmd &>/dev/null && \
+       ! command -v iptables &>/dev/null; then
+        info "No firewall management tool found — ports unrestricted"
+    fi
+
+    echo ""
+
+    # Quick reachability hint
+    info "Verify port 80 is reachable from outside before requesting a Let's Encrypt cert."
+    echo -e "  ${DIM}Test from external host: curl -sS http://YOUR.SERVER.IP/${R}"
+    echo ""
+}
+
+# ── Cron service ──────────────────────────────────────────────────────────────
+check_cron_service() {
+    echo -e "  ${BOLD}Verifying cron service…${R}"
+    hr; echo ""
+
+    local cron_service=""
+    for svc in cron crond cronie; do
+        if systemctl list-unit-files --no-legend 2>/dev/null | grep -qE "^${svc}\.service"; then
+            cron_service="$svc"
+            break
+        fi
+    done
+
+    if [[ -z "$cron_service" ]]; then
+        warn "No cron service unit found"
+    else
+        if systemctl is-active --quiet "$cron_service" 2>/dev/null; then
+            ok "${cron_service} is active"
+        else
+            warn "${cron_service} is not active"
+            if prompt_yn "Enable and start ${cron_service}?"; then
+                systemctl enable --now "$cron_service" 2>/dev/null && \
+                    ok "${cron_service} enabled and started" || \
+                    { err "Failed to start ${cron_service}"; pause_err; }
+            fi
+        fi
+    fi
+    echo ""
+}
+
 # ── Find source files ─────────────────────────────────────────────────────────
 SRC_PNGXCONF=""
 SRC_WIZARD=""
 
 find_sources() {
-    # pngxconf
     if [[ -f "${SCRIPT_DIR}/pngxconf" ]]; then
         SRC_PNGXCONF="${SCRIPT_DIR}/pngxconf"
     elif [[ -f "${SCRIPT_DIR}/pngxconf.sh" ]]; then
@@ -187,7 +497,6 @@ find_sources() {
         die "pngxconf source not found in ${SCRIPT_DIR}. Place pngxconf next to install.sh."
     fi
 
-    # ssl-wizard.sh
     if [[ -f "${SCRIPT_DIR}/ssl-wizard.sh" ]]; then
         SRC_WIZARD="${SCRIPT_DIR}/ssl-wizard.sh"
     else
@@ -201,14 +510,13 @@ find_sources() {
     fi
 }
 
-# ── Install ───────────────────────────────────────────────────────────────────
+# ── Install pngxconf binary and files ─────────────────────────────────────────
 do_install() {
     echo -e "  ${BOLD}Installing pngxconf…${R}"
     hr; echo ""
 
-    # 1. Create directories
     info "Creating directories…"
-    mkdir -p "$BIN_DIR" "$LIB_DIR" "$STATE_DIR" "$NGINX_BAK_DIR"
+    mkdir -p "$BIN_DIR" "$LIB_DIR" "$STATE_DIR" "$NGINX_BAK_DIR" 2>/dev/null
     chmod 755 "$BIN_DIR" "$LIB_DIR"
     chmod 700 "$STATE_DIR"
     ok "  ${BIN_DIR}"
@@ -216,7 +524,6 @@ do_install() {
     ok "  ${STATE_DIR}  ${DIM}(chmod 700)${R}"
     ok "  ${NGINX_BAK_DIR}"
 
-    # nginx dirs — create only if /etc/nginx exists (nginx installed)
     if [[ -d /etc/nginx ]]; then
         mkdir -p "$NGINX_CONFD" "$NGINX_SSL_DIR"
         chmod 755 "$NGINX_CONFD"
@@ -228,26 +535,23 @@ do_install() {
     fi
     echo ""
 
-    # 2. Install pngxconf binary
     info "Installing pngxconf binary…"
     if [[ -f "$PNGX_BIN" ]]; then
         local bak="${PNGX_BIN}.bak.$(date +%Y%m%d_%H%M%S)"
         cp "$PNGX_BIN" "$bak"
         warn "  Existing ${PNGX_BIN} backed up to ${bak}"
     fi
-    install -m 755 "$SRC_PNGXCONF" "$PNGX_BIN"
+    install -m 755 "$SRC_PNGXCONF" "$PNGX_BIN" || die "Failed to install pngxconf"
     ok "  ${PNGX_BIN}  ${DIM}(chmod 755)${R}"
     echo ""
 
-    # 3. Install ssl-wizard.sh
     if [[ -n "$SRC_WIZARD" ]]; then
         info "Installing ssl-wizard.sh…"
-        install -m 755 "$SRC_WIZARD" "$WIZARD_TARGET"
+        install -m 755 "$SRC_WIZARD" "$WIZARD_TARGET" || die "Failed to install ssl-wizard.sh"
         ok "  ${WIZARD_TARGET}  ${DIM}(chmod 755)${R}"
         echo ""
     fi
 
-    # 4. State files — create empty with correct permissions
     info "Initialising state files…"
     touch "${STATE_DIR}/state.conf" "${STATE_DIR}/sites.db" "${STATE_DIR}/certs.db" "${STATE_DIR}/pngxconf.log"
     chmod 600 "${STATE_DIR}/state.conf" "${STATE_DIR}/sites.db" "${STATE_DIR}/certs.db"
@@ -258,18 +562,16 @@ do_install() {
     ok "  ${STATE_DIR}/pngxconf.log"
     echo ""
 
-    # 5. Verify binary is in PATH
     info "Verifying installation…"
     if command -v pngxconf &>/dev/null; then
         ok "  pngxconf is in PATH"
     else
         warn "  ${BIN_DIR} not in PATH — you may need to restart your shell"
-        warn "  Or add to your shell rc: export PATH=\"${BIN_DIR}:\$PATH\""
     fi
     if bash -n "$PNGX_BIN"; then
         ok "  pngxconf syntax OK"
     else
-        die "  pngxconf syntax check failed — installation corrupt"
+        die "  pngxconf syntax check failed"
     fi
     echo ""
 }
@@ -280,7 +582,7 @@ do_uninstall() {
     hr; echo ""
 
     warn "This will remove pngxconf binary and ssl-wizard.sh."
-    warn "State files in ${STATE_DIR} and nginx configs will NOT be removed."
+    warn "State files in ${STATE_DIR} and nginx configs will NOT be removed by default."
     echo ""
     prompt_yn "Continue with uninstall?" || { info "Cancelled."; exit 0; }
     echo ""
@@ -296,7 +598,6 @@ do_uninstall() {
     else
         info "Keeping ${STATE_DIR}"
     fi
-
     echo ""
     ok "Uninstall complete."
 }
@@ -307,6 +608,7 @@ print_summary() {
     echo -e "  ${BOLD}${GREEN}Installation complete.${R}"
     echo ""
     echo -e "  ${DIM}Distribution  :${R}  ${WHITE}${DISTRO}${R}  ${DIM}[${DISTRO_FAMILY}]${R}"
+    echo -e "  ${DIM}Package mgr   :${R}  ${WHITE}${PKG_MGR}${R}"
     echo -e "  ${DIM}Binary        :${R}  ${WHITE}${PNGX_BIN}${R}"
     [[ -n "$SRC_WIZARD" ]] && \
         echo -e "  ${DIM}SSL wizard    :${R}  ${WHITE}${WIZARD_TARGET}${R}"
@@ -327,14 +629,23 @@ show_help() {
 ${BOLD}pngxconf installer${R}
 
 ${BOLD}Usage:${R}
-  sudo bash install.sh              Install pngxconf and ssl-wizard.sh
+  sudo bash install.sh              Install pngxconf, ssl-wizard.sh, and verify deps
   sudo bash install.sh --uninstall  Remove pngxconf
   sudo bash install.sh --help       Show this help
 
-${BOLD}What it installs:${R}
+${BOLD}What it installs / checks:${R}
   ${PNGX_BIN}            main binary (pngxconf command)
   ${WIZARD_TARGET}      SSL wizard
-  ${STATE_DIR}                   state dir (sites, certs, log)
+  ${STATE_DIR}                   state dir
+
+  Required packages (via system package manager):
+    nginx, openssl, curl, cron
+  Optional:
+    socat (for acme.sh standalone)
+    acme.sh (installed from native repos if available, else official installer)
+
+  Firewall checks:
+    ufw, firewalld, iptables — ensures port 80 and 443 are open for ACME
 
 ${BOLD}Source files required in current directory:${R}
   pngxconf         (required)
@@ -350,16 +661,25 @@ case "${1:-}" in
     --uninstall)
         require_root
         banner
+        detect_distro
         do_uninstall
         exit 0 ;;
     "")
         require_root
         banner
         detect_distro
-        info "Detected: ${WHITE}${DISTRO}${R} ${DIM}[${DISTRO_FAMILY}]${R}"
+        info "Detected: ${WHITE}${DISTRO}${R} ${DIM}[${DISTRO_FAMILY}]${R}  ${DIM}(package manager: ${PKG_MGR})${R}"
         echo ""
+
+        if [[ "$DISTRO_FAMILY" == "unknown" ]]; then
+            err "Unsupported distribution. install.sh requires apt/dnf/pacman/zypper."
+            pause_err
+            exit 1
+        fi
+
         find_sources
         check_prereqs
+        check_cron_service
         do_install
         print_summary
         ;;
